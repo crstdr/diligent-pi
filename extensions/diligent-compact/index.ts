@@ -11,6 +11,7 @@ import { completeSimple, type Model, type UserMessage } from "@mariozechner/pi-a
 import {
 	compact as runNativeCompact,
 	convertToLlm,
+	estimateTokens,
 	serializeConversation,
 	type CompactionResult,
 	type ExtensionAPI,
@@ -22,6 +23,7 @@ import {
 	applyPruningAtBoundary,
 	computePayloadFingerprint,
 	diligentContextRuntime,
+	formatTokens,
 	getToolCallBlockIds,
 	getToolResultId,
 	type EventMessage,
@@ -54,6 +56,8 @@ type SegmentedMessage = EventMessage & {
 const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 const OPINIONATED_REQUEST_TTL_MS = 2_000;
+const COMPACTION_TIMEOUT_MS = 120_000;
+const COMPACTION_STATUS_KEY = "diligent-compact";
 
 const pendingOpinionatedRequests = new Map<string, PendingOpinionatedRequest>();
 let nextOpinionatedRequestNonce = 1;
@@ -229,6 +233,10 @@ function armPendingOpinionatedRequest(ctx: ExtensionCommandContext): { sessionId
 		nonce,
 	});
 	return { sessionId, nonce };
+}
+
+function isPendingOpinionatedRequest(sessionId: string, nonce: number): boolean {
+	return pendingOpinionatedRequests.get(sessionId)?.nonce === nonce;
 }
 
 function consumeOpinionatedRequest(ctx: ExtensionContext): boolean {
@@ -481,6 +489,97 @@ function notify(ctx: ExtensionContext, text: string, level: "info" | "warning" |
 	console.log(`[diligent-compact] ${level}: ${text}`);
 }
 
+function setCompactionStatus(ctx: ExtensionContext, text?: string): void {
+	if (!ctx.hasUI) return;
+	const theme = ctx.ui.theme;
+	ctx.ui.setStatus(COMPACTION_STATUS_KEY, text ? theme.fg("accent", text) : undefined);
+}
+
+function startTimedCompactionSignal(parent: AbortSignal, timeoutMs: number): {
+	signal: AbortSignal;
+	cleanup: () => void;
+	didTimeout: () => boolean;
+} {
+	const controller = new AbortController();
+	let timedOut = false;
+	const abortFromParent = (): void => controller.abort();
+	if (parent.aborted) {
+		controller.abort();
+	} else {
+		parent.addEventListener("abort", abortFromParent, { once: true });
+	}
+	const timeoutId = setTimeout(() => {
+		timedOut = true;
+		controller.abort();
+	}, timeoutMs);
+	return {
+		signal: controller.signal,
+		cleanup: () => {
+			clearTimeout(timeoutId);
+			parent.removeEventListener("abort", abortFromParent);
+		},
+		didTimeout: () => timedOut,
+	};
+}
+
+function estimateTextTokens(text: string): number {
+	return Math.ceil(text.length / 4);
+}
+
+function estimatePromptInputTokens(systemPrompt: string, promptText: string, extraOverheadTokens: number = 0): number {
+	const userMessage: UserMessage = {
+		role: "user",
+		content: [{ type: "text", text: promptText }],
+		timestamp: 0,
+	};
+	return estimateTokens(userMessage as never) + estimateTextTokens(systemPrompt) + extraOverheadTokens;
+}
+
+function getSafePromptInputBudget(model: Model<any>, maxTokens?: number): number {
+	const contextWindow = typeof model.contextWindow === "number" && model.contextWindow > 0 ? model.contextWindow : 128000;
+	const outputReserve = typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : 0;
+	const safetyMargin = Math.min(4096, Math.max(1024, Math.floor(contextWindow * 0.03)));
+	return Math.max(0, contextWindow - outputReserve - safetyMargin);
+}
+
+function assertPromptFitsBudget(args: {
+	label: string;
+	model: Model<any>;
+	systemPrompt: string;
+	promptText: string;
+	maxTokens?: number;
+	extraOverheadTokens?: number;
+}): void {
+	const estimatedInputTokens = estimatePromptInputTokens(
+		args.systemPrompt,
+		args.promptText,
+		args.extraOverheadTokens ?? 0,
+	);
+	const safeBudget = getSafePromptInputBudget(args.model, args.maxTokens);
+	if (estimatedInputTokens <= safeBudget) return;
+	throw new Error(
+		`${args.label} prompt too large for ${args.model.provider}/${args.model.id}: estimated input ${formatTokens(estimatedInputTokens)} exceeds safe budget ${formatTokens(safeBudget)}`,
+	);
+}
+
+function buildCompatibilityPromptEstimate(args: {
+	conversationText: string;
+	previousSummary?: string;
+	customInstructions?: string;
+}): string {
+	let promptText = `<conversation>\n${args.conversationText}\n</conversation>\n\n`;
+	const previousSummary = (args.previousSummary ?? "").trim();
+	if (previousSummary.length > 0) {
+		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+	}
+	promptText += "Create a structured context checkpoint summary that another LLM will use to continue the work.";
+	const customInstructions = (args.customInstructions ?? "").trim();
+	if (customInstructions.length > 0) {
+		promptText += `\n\nAdditional focus: ${customInstructions}`;
+	}
+	return promptText;
+}
+
 async function getCurrentModelWithApiKey(
 	ctx: ExtensionContext,
 ): Promise<{ model: Model<any>; apiKey: string } | null> {
@@ -533,29 +632,74 @@ async function runCompatibilityCompaction(args: {
 	if (!modelWithKey) {
 		throw new Error("No current model/API key available for compatibility compaction");
 	}
+	const reserveTokens = args.preparation.settings?.reserveTokens;
+	const historyMaxTokens = (typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0)
+		? Math.floor(0.8 * reserveTokens)
+		: undefined;
+	if (args.preparation.messagesToSummarize.length > 0) {
+		const historyPromptText = buildCompatibilityPromptEstimate({
+			conversationText: serializeConversation(convertToLlm(args.preparation.messagesToSummarize)),
+			previousSummary: typeof args.preparation.previousSummary === "string" ? args.preparation.previousSummary : undefined,
+			customInstructions: args.customInstructions,
+		});
+		assertPromptFitsBudget({
+			label: "compatibility compaction",
+			model: modelWithKey.model,
+			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+			promptText: historyPromptText,
+			maxTokens: historyMaxTokens,
+			extraOverheadTokens: 1536,
+		});
+	}
+	if (args.preparation.isSplitTurn && args.preparation.turnPrefixMessages.length > 0) {
+		const splitPromptText = `<conversation>\n${serializeConversation(convertToLlm(args.preparation.turnPrefixMessages))}\n</conversation>\n\nSummarize only the retained turn prefix context.`;
+		assertPromptFitsBudget({
+			label: "compatibility split-turn compaction",
+			model: modelWithKey.model,
+			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+			promptText: splitPromptText,
+			maxTokens: typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0
+				? Math.floor(0.5 * reserveTokens)
+				: undefined,
+			extraOverheadTokens: 1024,
+		});
+	}
 	debugLog(
 		`route=compatibility provider=${modelWithKey.model.provider} model=${modelWithKey.model.id} delta=${args.preparation.messagesToSummarize.length} prefix=${args.preparation.turnPrefixMessages.length}`,
 	);
-	const result = await runNativeCompact(
-		args.preparation,
-		modelWithKey.model,
-		modelWithKey.apiKey,
-		args.customInstructions,
-		args.signal,
-	);
-	if (CONFIG.debugCompactions) {
-		saveCompactionDebug(args.sessionId, {
-			kind: "compatibility_success",
-			provider: modelWithKey.model.provider,
-			model: modelWithKey.model.id,
-			messagesToSummarizeCount: args.preparation.messagesToSummarize.length,
-			turnPrefixMessagesCount: args.preparation.turnPrefixMessages.length,
-			usedPreviousSummary: Boolean(args.preparation.previousSummary),
-			customInstructionsPresent: Boolean(args.customInstructions),
-			outputSummaryChars: result.summary.length,
-		});
+	const timed = startTimedCompactionSignal(args.signal, COMPACTION_TIMEOUT_MS);
+	try {
+		const result = await runNativeCompact(
+			args.preparation,
+			modelWithKey.model,
+			modelWithKey.apiKey,
+			args.customInstructions,
+			timed.signal,
+		);
+		if (timed.didTimeout()) {
+			throw new Error(`compatibility compaction timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
+		}
+		if (CONFIG.debugCompactions) {
+			saveCompactionDebug(args.sessionId, {
+				kind: "compatibility_success",
+				provider: modelWithKey.model.provider,
+				model: modelWithKey.model.id,
+				messagesToSummarizeCount: args.preparation.messagesToSummarize.length,
+				turnPrefixMessagesCount: args.preparation.turnPrefixMessages.length,
+				usedPreviousSummary: Boolean(args.preparation.previousSummary),
+				customInstructionsPresent: Boolean(args.customInstructions),
+				outputSummaryChars: result.summary.length,
+			});
+		}
+		return result;
+	} catch (error) {
+		if (timed.didTimeout()) {
+			throw new Error(`compatibility compaction timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
+		}
+		throw error;
+	} finally {
+		timed.cleanup();
 	}
-	return result;
 }
 
 async function runOpinionatedCompaction(args: {
@@ -591,6 +735,14 @@ async function runOpinionatedCompaction(args: {
 	const maxTokens = (typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0)
 		? Math.floor(0.8 * reserveTokens)
 		: undefined;
+	assertPromptFitsBudget({
+		label: "diligent-compact",
+		model: selected.model,
+		systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+		promptText,
+		maxTokens,
+		extraOverheadTokens: 512,
+	});
 
 	notify(
 		args.ctx,
@@ -624,57 +776,69 @@ async function runOpinionatedCompaction(args: {
 		completeOptions.maxTokens = maxTokens;
 	}
 
-	const response = await completeSimple(
-		selected.model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: [userMessage] },
-		completeOptions,
-	);
+	const timed = startTimedCompactionSignal(args.signal, COMPACTION_TIMEOUT_MS);
+	try {
+		const response = await completeSimple(
+			selected.model,
+			{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: [userMessage] },
+			{ ...completeOptions, signal: timed.signal },
+		);
+		if (timed.didTimeout()) {
+			throw new Error(`diligent-compact timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
+		}
+		if (response.stopReason === "aborted" || args.signal.aborted) {
+			throw new Error("Compaction cancelled");
+		}
+		if (response.stopReason === "error") {
+			throw new Error(response.errorMessage ?? "Opinionated compaction failed");
+		}
 
-	if (response.stopReason === "aborted" || args.signal.aborted) {
-		throw new Error("Compaction cancelled");
-	}
-	if (response.stopReason === "error") {
-		throw new Error(response.errorMessage ?? "Opinionated compaction failed");
-	}
+		const summary = response.content
+			.filter((content): content is { type: "text"; text: string } => content.type === "text")
+			.map((content) => content.text)
+			.join("\n")
+			.trim();
+		if (!summary) {
+			throw new Error("Opinionated compaction returned empty summary");
+		}
 
-	const summary = response.content
-		.filter((content): content is { type: "text"; text: string } => content.type === "text")
-		.map((content) => content.text)
-		.join("\n")
-		.trim();
-	if (!summary) {
-		throw new Error("Opinionated compaction returned empty summary");
-	}
-
-	saveCompactionDebug(args.sessionId, {
-		kind: "opinionated_success",
-		provider: selected.model.provider,
-		model: selected.model.id,
-		thinkingLevel: selected.thinkingLevel,
-		maxTokens,
-		firstKeptEntryId: args.preparation.firstKeptEntryId,
-		tokensBefore: args.preparation.tokensBefore,
-		previousSummaryChars: previousSummary?.length ?? 0,
-		conversationChars: conversationText.length,
-		splitTurnPrefixChars: splitTurnPrefixText?.length ?? 0,
-		customInstructionsPresent: Boolean(args.customInstructions),
-		usage: response.usage,
-		outputSummaryChars: summary.length,
-	});
-
-	return {
-		summary,
-		firstKeptEntryId: args.preparation.firstKeptEntryId,
-		tokensBefore: args.preparation.tokensBefore,
-		details: {
+		saveCompactionDebug(args.sessionId, {
+			kind: "opinionated_success",
 			provider: selected.model.provider,
-			modelId: selected.model.id,
+			model: selected.model.id,
 			thinkingLevel: selected.thinkingLevel,
-			deltaMessages: args.preparation.messagesToSummarize.length,
-			splitTurnPrefixMessages: args.preparation.turnPrefixMessages.length,
-			usedPreviousSummary: Boolean(previousSummary && previousSummary.trim().length > 0),
-		},
-	};
+			maxTokens,
+			firstKeptEntryId: args.preparation.firstKeptEntryId,
+			tokensBefore: args.preparation.tokensBefore,
+			previousSummaryChars: previousSummary?.length ?? 0,
+			conversationChars: conversationText.length,
+			splitTurnPrefixChars: splitTurnPrefixText?.length ?? 0,
+			customInstructionsPresent: Boolean(args.customInstructions),
+			usage: response.usage,
+			outputSummaryChars: summary.length,
+		});
+
+		return {
+			summary,
+			firstKeptEntryId: args.preparation.firstKeptEntryId,
+			tokensBefore: args.preparation.tokensBefore,
+			details: {
+				provider: selected.model.provider,
+				modelId: selected.model.id,
+				thinkingLevel: selected.thinkingLevel,
+				deltaMessages: args.preparation.messagesToSummarize.length,
+				splitTurnPrefixMessages: args.preparation.turnPrefixMessages.length,
+				usedPreviousSummary: Boolean(previousSummary && previousSummary.trim().length > 0),
+			},
+		};
+	} catch (error) {
+		if (timed.didTimeout()) {
+			throw new Error(`diligent-compact timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
+		}
+		throw error;
+	} finally {
+		timed.cleanup();
+	}
 }
 
 export default function diligentCompactExtension(pi: ExtensionAPI) {
@@ -682,14 +846,32 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 		description: "Run opinionated visibility-aware compaction. Usage: /diligent-compact [instructions]",
 		handler: async (args, ctx) => {
 			const { sessionId, nonce } = armPendingOpinionatedRequest(ctx);
+			setCompactionStatus(ctx, "diligent-compact: running");
 			try {
 				ctx.compact({
 					customInstructions: args.trim() || undefined,
-					onComplete: () => clearPendingOpinionatedRequest(sessionId, nonce),
-					onError: () => clearPendingOpinionatedRequest(sessionId, nonce),
+					onComplete: (result) => {
+						clearPendingOpinionatedRequest(sessionId, nonce);
+						setCompactionStatus(ctx, undefined);
+						notify(
+							ctx,
+							`diligent-compact complete: visible context checkpoint saved (${formatTokens(result.tokensBefore)} before compaction)`,
+							"info",
+						);
+					},
+					onError: (error) => {
+						const shouldNotify = isPendingOpinionatedRequest(sessionId, nonce);
+						clearPendingOpinionatedRequest(sessionId, nonce);
+						setCompactionStatus(ctx, undefined);
+						if (!shouldNotify) return;
+						const message = error instanceof Error ? error.message : String(error);
+						if (message === "Compaction cancelled") return;
+						notify(ctx, `diligent-compact failed: ${message}`, "warning");
+					},
 				});
 			} catch (error) {
 				clearPendingOpinionatedRequest(sessionId, nonce);
+				setCompactionStatus(ctx, undefined);
 				throw error;
 			}
 		},
@@ -767,6 +949,9 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 			return { compaction: attachDiligentDetails(result, route, anchorSignature, proof !== "unproven") };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			if (signal.aborted || message === "Compaction cancelled") {
+				return { cancel: true };
+			}
 			if (route === "compatibility") {
 				notify(
 					ctx,

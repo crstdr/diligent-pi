@@ -277,9 +277,13 @@ function updateStatus(ctx: ExtensionContext, state: CleanContextState, messages?
 		ctx.ui.setStatus(STATUS_KEY, theme.fg("accent", "anchor:pending"));
 		return;
 	}
-	const resolvedAnchorIndex = messages ? resolveAnchorIndex(messages, state.anchorFingerprint) : null;
+	if (!messages || messages.length === 0) {
+		ctx.ui.setStatus(STATUS_KEY, theme.fg("accent", "anchor:restoring"));
+		return;
+	}
+	const resolvedAnchorIndex = resolveAnchorIndex(messages, state.anchorFingerprint);
 	const statusText =
-		resolvedAnchorIndex === null || !messages
+		resolvedAnchorIndex === null
 			? "anchor:?"
 			: `anchor:${resolvedAnchorIndex + 1}/${messages.length}`;
 	ctx.ui.setStatus(STATUS_KEY, theme.fg("accent", statusText));
