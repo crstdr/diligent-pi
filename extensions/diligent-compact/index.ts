@@ -10,8 +10,10 @@
 import { completeSimple, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import {
 	compact as runNativeCompact,
+	CompactionSummaryMessageComponent,
 	convertToLlm,
 	estimateTokens,
+	getMarkdownTheme,
 	serializeConversation,
 	type CompactionResult,
 	type ExtensionAPI,
@@ -40,6 +42,7 @@ type CompactionPreparation = SessionBeforeCompactEvent["preparation"];
 type PendingOpinionatedRequest = {
 	expiresAt: number;
 	nonce: number;
+	fallbackThinkingLevel: ThinkingLevel;
 };
 
 type DiligentCompactionDetails = {
@@ -56,8 +59,9 @@ type SegmentedMessage = EventMessage & {
 const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 const OPINIONATED_REQUEST_TTL_MS = 2_000;
-const COMPACTION_TIMEOUT_MS = 120_000;
+const COMPACTION_TIMEOUT_MS = 180_000;
 const COMPACTION_STATUS_KEY = "diligent-compact";
+const COMPACTION_SUMMARY_WIDGET_KEY = "diligent-compact-summary";
 
 const pendingOpinionatedRequests = new Map<string, PendingOpinionatedRequest>();
 let nextOpinionatedRequestNonce = 1;
@@ -225,12 +229,16 @@ function clearPendingOpinionatedRequest(sessionId: string, nonce?: number): void
 	pendingOpinionatedRequests.delete(sessionId);
 }
 
-function armPendingOpinionatedRequest(ctx: ExtensionCommandContext): { sessionId: string; nonce: number } {
+function armPendingOpinionatedRequest(
+	ctx: ExtensionCommandContext,
+	fallbackThinkingLevel: ThinkingLevel,
+): { sessionId: string; nonce: number } {
 	const sessionId = getSessionId(ctx);
 	const nonce = nextOpinionatedRequestNonce++;
 	pendingOpinionatedRequests.set(sessionId, {
 		expiresAt: Date.now() + OPINIONATED_REQUEST_TTL_MS,
 		nonce,
+		fallbackThinkingLevel,
 	});
 	return { sessionId, nonce };
 }
@@ -239,16 +247,16 @@ function isPendingOpinionatedRequest(sessionId: string, nonce: number): boolean 
 	return pendingOpinionatedRequests.get(sessionId)?.nonce === nonce;
 }
 
-function consumeOpinionatedRequest(ctx: ExtensionContext): boolean {
+function consumeOpinionatedRequest(ctx: ExtensionContext): PendingOpinionatedRequest | null {
 	const sessionId = getSessionId(ctx);
 	const request = pendingOpinionatedRequests.get(sessionId);
-	if (!request) return false;
+	if (!request) return null;
 	if (request.expiresAt < Date.now()) {
 		pendingOpinionatedRequests.delete(sessionId);
-		return false;
+		return null;
 	}
 	pendingOpinionatedRequests.delete(sessionId);
-	return true;
+	return request;
 }
 
 function findUniqueFullPayloadIndex(message: EventMessage, fullPayload: EventMessage[]): number | null {
@@ -495,6 +503,32 @@ function setCompactionStatus(ctx: ExtensionContext, text?: string): void {
 	ctx.ui.setStatus(COMPACTION_STATUS_KEY, text ? theme.fg("accent", text) : undefined);
 }
 
+function clearCompactionSummaryWidget(ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
+	ctx.ui.setWidget(COMPACTION_SUMMARY_WIDGET_KEY, undefined, { placement: "aboveEditor" });
+}
+
+function showCompactionSummaryWidget(ctx: ExtensionContext, args: { summary: string; tokensBefore: number; timestamp: string }): void {
+	if (!ctx.hasUI) return;
+	ctx.ui.setWidget(
+		COMPACTION_SUMMARY_WIDGET_KEY,
+		() => {
+			const component = new CompactionSummaryMessageComponent(
+				{
+					role: "compactionSummary",
+					summary: args.summary,
+					tokensBefore: args.tokensBefore,
+					timestamp: new Date(args.timestamp).getTime(),
+				},
+				getMarkdownTheme(),
+			);
+			component.setExpanded(true);
+			return component;
+		},
+		{ placement: "aboveEditor" },
+	);
+}
+
 function startTimedCompactionSignal(parent: AbortSignal, timeoutMs: number): {
 	signal: AbortSignal;
 	cleanup: () => void;
@@ -591,6 +625,7 @@ async function getCurrentModelWithApiKey(
 
 async function selectOpinionatedModel(
 	ctx: ExtensionContext,
+	fallbackThinkingLevel: ThinkingLevel,
 ): Promise<{ model: Model<any>; apiKey: string; thinkingLevel: ThinkingLevel } | null> {
 	for (const cfg of CONFIG.compactionModels) {
 		const registryModel = ctx.modelRegistry
@@ -617,7 +652,7 @@ async function selectOpinionatedModel(
 	return {
 		model: current.model,
 		apiKey: current.apiKey,
-		thinkingLevel: CONFIG.thinkingLevel,
+		thinkingLevel: fallbackThinkingLevel,
 	};
 }
 
@@ -708,8 +743,9 @@ async function runOpinionatedCompaction(args: {
 	customInstructions?: string;
 	signal: AbortSignal;
 	sessionId: string;
+	fallbackThinkingLevel: ThinkingLevel;
 }): Promise<CompactionResult> {
-	const selected = await selectOpinionatedModel(args.ctx);
+	const selected = await selectOpinionatedModel(args.ctx, args.fallbackThinkingLevel);
 	if (!selected) {
 		throw new Error("No model/API key available for opinionated compaction");
 	}
@@ -845,7 +881,8 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 	pi.registerCommand("diligent-compact", {
 		description: "Run opinionated visibility-aware compaction. Usage: /diligent-compact [instructions]",
 		handler: async (args, ctx) => {
-			const { sessionId, nonce } = armPendingOpinionatedRequest(ctx);
+			const { sessionId, nonce } = armPendingOpinionatedRequest(ctx, pi.getThinkingLevel());
+			clearCompactionSummaryWidget(ctx);
 			setCompactionStatus(ctx, "diligent-compact: running");
 			try {
 				ctx.compact({
@@ -877,11 +914,37 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.on("session_start", async (_event, ctx) => {
+		clearCompactionSummaryWidget(ctx);
+		setCompactionStatus(ctx, undefined);
+	});
+
+	pi.on("session_switch", async (_event, ctx) => {
+		clearCompactionSummaryWidget(ctx);
+		setCompactionStatus(ctx, undefined);
+	});
+
+	pi.on("session_compact", async (event, ctx) => {
+		const details = (event.compactionEntry.details && typeof event.compactionEntry.details === "object" && !Array.isArray(event.compactionEntry.details))
+			? event.compactionEntry.details as DiligentCompactionDetails
+			: null;
+		if (details?.route === "opinionated") {
+			showCompactionSummaryWidget(ctx, {
+				summary: event.compactionEntry.summary,
+				tokensBefore: event.compactionEntry.tokensBefore,
+				timestamp: event.compactionEntry.timestamp,
+			});
+			return;
+		}
+		clearCompactionSummaryWidget(ctx);
+	});
+
 	pi.on("session_before_compact", async (event, ctx) => {
 		const { preparation, branchEntries, signal, customInstructions } = event as SessionBeforeCompactEvent;
 		const sessionId = getSessionId(ctx);
 		const { filteredPreparation, visibilityChanged, summaryResetRequired, anchorSignature, proof } = buildFilteredPreparation(preparation, branchEntries);
-		const route: CompactionRoute = consumeOpinionatedRequest(ctx)
+		const opinionatedRequest = consumeOpinionatedRequest(ctx);
+		const route: CompactionRoute = opinionatedRequest
 			? "opinionated"
 			: anchorSignature !== null
 				? "compatibility"
@@ -937,6 +1000,7 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 					customInstructions,
 					signal,
 					sessionId,
+					fallbackThinkingLevel: opinionatedRequest?.fallbackThinkingLevel ?? CONFIG.thinkingLevel,
 				})
 				: await runCompatibilityCompaction({
 					ctx,
