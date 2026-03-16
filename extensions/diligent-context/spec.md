@@ -6,10 +6,9 @@ This document captures the rationale and UX decisions behind the `diligent-conte
 
 ### Layout
 
-```text
+```
 extensions/diligent-context/
 ├── index.ts    — runtime extension
-├── core.ts     — shared payload-grounded pruning helpers
 ├── README.md   — feature spec (commands, state model, filtering, picker UX)
 └── spec.md     — rationale and decision history (this file)
 ```
@@ -370,9 +369,9 @@ If you modify this extension later, preserve these constraints unless there is a
 
 ## Future improvement areas
 
-### 1. Keep the install story simple
+### 1. Publish to GitHub
 
-The extension is intentionally folder-based so it can be copied directly into `~/.pi/agent/extensions/` or a project-local `.pi/extensions/` folder.
+The extension is now folder-based and ready to be published as a standalone Pi extension.
 
 ### 2. Better live feedback after pruning
 

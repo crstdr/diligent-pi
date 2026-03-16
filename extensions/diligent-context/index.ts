@@ -16,6 +16,7 @@ import {
   DILIGENT_CONTEXT_STATUS_KEY as STATUS_KEY,
   OFF_STATE,
   applyPruningAtBoundary,
+  buildContextMessageEntries,
   collectPayloadDiagnostics,
   computePayloadFingerprint,
   countToolCalls,
@@ -28,12 +29,14 @@ import {
   hasThinkingBlock,
   isToolHeavyMessage,
   loadStateFromSession,
+  messagesMatchForContextAlignment,
   resolveAnchorIndex,
   setDiligentContextRuntimeSnapshot,
   truncate,
   type DiligentContextState as CleanContextState,
   type EventMessage,
-} from "./core";
+  type SessionEntry,
+} from "./core.ts";
 
 type DynamicPickerItem = {
 	value: string;
@@ -304,18 +307,97 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 	let cachedVisibleToRawIndices: number[] = [];
 	let previousPayloadIds: Set<string> | null = null;
 
+	const getSessionId = (ctx: ExtensionContext): string | null => ctx.sessionManager.getSessionId?.() ?? null;
+
 	const reconstruct = (ctx: ExtensionContext): void => {
 		state = loadStateFromSession(ctx);
 		cachedLivePayload = null;
 		cachedRawPayload = null;
 		cachedVisibleToRawIndices = [];
 		previousPayloadIds = null;
-		setDiligentContextRuntimeSnapshot(null);
+		setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
+		updateStatus(ctx, state, cachedRawPayload);
+	};
+
+	const refreshCachedSnapshot = (ctx: ExtensionContext): void => {
+		if (!cachedRawPayload) {
+			cachedLivePayload = null;
+			cachedVisibleToRawIndices = [];
+			previousPayloadIds = null;
+			setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
+			return;
+		}
+		let filteredMessages = cachedRawPayload;
+		let keptRawIndices = cachedRawPayload.map((_, index) => index);
+		const resolvedAnchorIndex = state.enabled ? resolveAnchorIndex(cachedRawPayload, state.anchorFingerprint) : null;
+		if (state.enabled && resolvedAnchorIndex !== null) {
+			const pruneResult = applyPruningAtBoundary(cachedRawPayload, resolvedAnchorIndex, state.anchorMode ?? "from-entry");
+			filteredMessages = pruneResult.filteredMessages;
+			keptRawIndices = pruneResult.keptRawIndices;
+		}
+		cachedVisibleToRawIndices = keptRawIndices;
+		cachedLivePayload = filteredMessages.map((msg) => ({ ...msg }));
+		setDiligentContextRuntimeSnapshot(getSessionId(ctx), {
+			state,
+			rawMessages: cachedRawPayload,
+			filteredMessages: cachedLivePayload,
+			filteredToRawIndices: [...cachedVisibleToRawIndices],
+			resolvedAnchorIndex,
+		});
+	};
+
+	const reconcileTurnEndSnapshot = (ctx: ExtensionContext, message: EventMessage): void => {
+		if (!cachedRawPayload) return;
+		if (message.role !== "assistant") return;
+		const branchEntries = (ctx.sessionManager.getBranch?.() ?? []) as SessionEntry[];
+		const contextEntries = buildContextMessageEntries(branchEntries);
+		let rawIndex = 0;
+		const remainingEntries: Array<{ sourceType: string; message: EventMessage }> = [];
+		for (const contextEntry of contextEntries) {
+			if (rawIndex < cachedRawPayload.length) {
+				if (messagesMatchForContextAlignment(contextEntry.message, cachedRawPayload[rawIndex])) {
+					rawIndex += 1;
+					continue;
+				}
+				if (contextEntry.sourceType === "custom_message") {
+					continue;
+				}
+				console.log(`[diligent-context.turn_end] skip: prefix mismatch at ${rawIndex}`);
+				return;
+			}
+			remainingEntries.push(contextEntry);
+		}
+		if (rawIndex !== cachedRawPayload.length) {
+			console.log(`[diligent-context.turn_end] skip: matched=${rawIndex} cached=${cachedRawPayload.length}`);
+			return;
+		}
+		const remainingRequired = remainingEntries.filter((entry) => entry.sourceType !== "custom_message");
+		if (remainingRequired.length !== 1) {
+			console.log(
+				`[diligent-context.turn_end] skip: remainingRequired=${remainingRequired.length} remainingTotal=${remainingEntries.length}`,
+			);
+			return;
+		}
+		const [finalRequired] = remainingRequired;
+		if (finalRequired.message.role !== "assistant" || !messagesMatchForContextAlignment(finalRequired.message, message)) {
+			console.log("[diligent-context.turn_end] skip: final assistant mismatch");
+			return;
+		}
+		const clonedMessage: EventMessage = {
+			...message,
+			content: Array.isArray(message.content) ? message.content.map((block) => ({ ...block })) : message.content,
+		};
+		cachedRawPayload = [...cachedRawPayload, clonedMessage];
+		refreshCachedSnapshot(ctx);
+		if (cachedLivePayload) {
+			previousPayloadIds = collectPayloadDiagnostics(cachedLivePayload).payloadToolIds;
+		}
 		updateStatus(ctx, state, cachedRawPayload);
 	};
 
 	const persist = (ctx: ExtensionContext): void => {
 		pi.appendEntry(CLEAN_CONTEXT_CUSTOM_TYPE, state);
+		refreshCachedSnapshot(ctx);
 		updateStatus(ctx, state, cachedRawPayload);
 	};
 
@@ -364,7 +446,7 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 		cachedRawPayload = null;
 		cachedVisibleToRawIndices = [];
 		previousPayloadIds = null;
-		setDiligentContextRuntimeSnapshot(null);
+		setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
 		persist(ctx);
 	};
 
@@ -530,10 +612,14 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 		cachedRawPayload = null;
 		cachedVisibleToRawIndices = [];
 		previousPayloadIds = null;
-		setDiligentContextRuntimeSnapshot(null);
+		setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
 		if (ctx.hasUI) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 		}
+	});
+
+	pi.on("turn_end", async (event, ctx) => {
+		reconcileTurnEndSnapshot(ctx, event.message as EventMessage);
 	});
 
 	pi.registerCommand("diligent-context", {
@@ -618,12 +704,14 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 
 		cachedRawPayload = rawMessages.map((msg) => ({ ...msg }));
 		cachedVisibleToRawIndices = keptRawIndices;
-		setDiligentContextRuntimeSnapshot({
+		cachedLivePayload = filteredMessages.map((msg) => ({ ...msg }));
+		setDiligentContextRuntimeSnapshot(getSessionId(ctx), {
 			state,
 			rawMessages: cachedRawPayload,
+			filteredMessages: cachedLivePayload,
+			filteredToRawIndices: [...cachedVisibleToRawIndices],
 			resolvedAnchorIndex,
 		});
-		cachedLivePayload = filteredMessages.map((msg) => ({ ...msg }));
 		updateStatus(ctx, state, cachedRawPayload);
 		const currentDiagnostics = collectPayloadDiagnostics(cachedLivePayload);
 		if (previousPayloadIds) {

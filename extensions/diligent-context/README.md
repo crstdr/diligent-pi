@@ -241,10 +241,9 @@ This helps determine whether payload-native IDs remain stable across calls or wh
 
 ## Extension layout
 
-```text
+```
 extensions/diligent-context/
 ├── index.ts    — runtime extension
-├── core.ts     — shared payload-grounded pruning helpers
 ├── README.md   — feature spec (this file)
 └── spec.md     — rationale and decision history
 ```

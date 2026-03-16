@@ -5,7 +5,7 @@ A small collection of Pi extensions focused on **careful context shaping** rathe
 Current extensions:
 
 - **diligent-context** — hide stale tool chatter from the live payload while preserving the human conversation
-- **diligent-compact** — keep compaction aligned with the context that remains visible under `diligent-context`, while also adding an explicit `/diligent-compact` command
+- **diligent-compact** — keep compaction aligned with the context that remains visible under `diligent-context`, with diagnostics and an explicit `/diligent-compact` command
 
 ## Install
 
@@ -40,6 +40,7 @@ cp -R extensions/diligent-compact ~/.pi/agent/extensions/
 
 - `/compact`
 - `/diligent-compact [instructions]`
+- `/diligent-compact --force-native [instructions]`
 
 ## Notes
 

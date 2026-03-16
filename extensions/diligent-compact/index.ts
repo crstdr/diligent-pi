@@ -22,13 +22,22 @@ import {
 	type SessionBeforeCompactEvent,
 } from "@mariozechner/pi-coding-agent";
 import {
-	applyPruningAtBoundary,
-	computePayloadFingerprint,
-	diligentContextRuntime,
+	getContextAlignmentComparable,
+	getContextAlignmentMismatchFields,
+	getDiligentContextRuntimeSnapshot,
+	estimatePayloadTokens,
 	formatTokens,
-	getToolCallBlockIds,
-	getToolResultId,
+	getPayloadNarrativeLabel,
+	getToolCallNames,
+	messagesMatchForContextAlignment,
+	loadStateFromEntries,
+	type ContextAlignmentComparable,
+	type ContextAlignmentField,
+	type ContextMessageEntry,
+	type DiligentContextRuntimeSnapshot,
 	type EventMessage,
+	type SessionEntry,
+	buildContextMessageEntries,
 } from "../diligent-context/core.ts";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -37,33 +46,108 @@ import { fileURLToPath } from "node:url";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
-type CompactionRoute = "native" | "compatibility" | "opinionated";
+type CompactionRoute = "native" | "compatibility" | "opinionated" | "force-native";
 type CompactionPreparation = SessionBeforeCompactEvent["preparation"];
-type PendingOpinionatedRequest = {
+type PendingCompactionRequest = {
 	expiresAt: number;
 	nonce: number;
+	mode: "opinionated" | "force-native";
 	fallbackThinkingLevel: ThinkingLevel;
 };
 
 type DiligentCompactionDetails = {
 	diligentContextAnchorSignature?: string;
-	diligentContextSummarySafe?: boolean;
-	route?: Exclude<CompactionRoute, "native">;
+	route?: Exclude<CompactionRoute, "native" | "force-native">;
 	[key: string]: unknown;
 };
 
-type SegmentedMessage = EventMessage & {
-	__diligentSegment?: "prefix" | "delta";
+type FileOpsLike = {
+	read: Set<string>;
+	written: Set<string>;
+	edited: Set<string>;
 };
+
+type DiagnosticMessageSummary = {
+	index: number;
+	role: string | null;
+	sourceType?: ContextMessageEntry["sourceType"];
+	customType: string | null;
+	toolResultId: string | null;
+	text: string | null;
+	toolNames: string[] | null;
+};
+
+type AlignmentStats = {
+	rawMessageCount: number;
+	contextEntryCount: number;
+	requiredContextEntryCount: number;
+	matchedPrefixCount: number;
+	skippedCustomMessageCount: number;
+};
+
+type AlignmentDivergenceDiagnostic = {
+	kind: "required-entry-mismatch" | "required-context-tail" | "unmatched-raw-tail";
+	stats: AlignmentStats;
+	rawIndex: number | null;
+	contextIndex: number | null;
+	mismatchFields?: ContextAlignmentField[];
+	rawWindow: DiagnosticMessageSummary[];
+	contextWindow: DiagnosticMessageSummary[];
+};
+
+type VisiblePreparationFailureDiagnostic =
+	| {
+			kind: "filtered-to-raw-length-mismatch";
+			filteredMessageCount: number;
+			filteredToRawCount: number;
+			rawMessageCount: number;
+		}
+	| {
+			kind: "raw-context-alignment-divergence";
+			alignment: AlignmentDivergenceDiagnostic;
+		}
+	| {
+			kind: "first-kept-entry-id-missing";
+			firstKeptVisibleIndex: number;
+			firstKeptRawIndex: number | null;
+			rawMessageCount: number;
+			mappingCount: number;
+		};
+
+type VisiblePreparationBuildResult =
+	| {
+			ok: true;
+			preparation: CompactionPreparation;
+			anchorSignature: string | null;
+			totalVisibleMessages: number;
+			summarizedVisibleMessages: number;
+			keptVisibleMessages: number;
+		}
+	| {
+			ok: false;
+			reason:
+				| "no-live-payload"
+				| "anchor-restoring"
+				| "context-mapping-mismatch"
+				| "nothing-visible-to-compact";
+			message: string;
+			diagnostic?: VisiblePreparationFailureDiagnostic;
+		};
+
+function isVisiblePreparationFailure(
+	result: VisiblePreparationBuildResult,
+): result is Extract<VisiblePreparationBuildResult, { ok: false }> {
+	return result.ok === false;
+}
 
 const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
-const OPINIONATED_REQUEST_TTL_MS = 2_000;
+const OPINIONATED_REQUEST_TTL_MS = 10_000;
 const COMPACTION_TIMEOUT_MS = 180_000;
 const COMPACTION_STATUS_KEY = "diligent-compact";
 const COMPACTION_SUMMARY_WIDGET_KEY = "diligent-compact-summary";
 
-const pendingOpinionatedRequests = new Map<string, PendingOpinionatedRequest>();
+const pendingCompactionRequests = new Map<string, PendingCompactionRequest>();
 let nextOpinionatedRequestNonce = 1;
 
 type CompactionModelConfig = {
@@ -93,6 +177,7 @@ const CONFIG_PATH = path.join(EXTENSION_DIR, "config.json");
 const PROMPT_PATH = path.join(EXTENSION_DIR, "compaction-prompt.md");
 
 const COMPACTIONS_DIR = path.join(homedir(), ".pi", "agent", "extensions", "diligent-compact", "compactions");
+const LATEST_ALIGNMENT_DIAGNOSTIC_PATH = path.join(COMPACTIONS_DIR, "latest-alignment-divergence.json");
 
 const SUMMARIZATION_SYSTEM_PROMPT =
 	"You are a context summarization assistant. " +
@@ -102,7 +187,6 @@ const SUMMARIZATION_SYSTEM_PROMPT =
 
 const DEFAULT_PROMPT_BODY =
 	"Output ONLY markdown. Keep it concise. Use the exact format requested in the user prompt.";
-const VISIBILITY_RESET_SUMMARY = "Older hidden context omitted by diligent-context.";
 
 function normalizeThinkingLevel(value: unknown): ThinkingLevel | undefined {
 	if (typeof value !== "string") return undefined;
@@ -212,171 +296,101 @@ function buildPromptText(args: {
 	return blocks.join("\n\n").trim();
 }
 
-function sameStringArray(a: string[] | null, b: string[] | null): boolean {
-	if (a === null || b === null) return a === b;
-	if (a.length !== b.length) return false;
-	return a.every((value, index) => value === b[index]);
+function getRuntimeSessionId(ctx: ExtensionContext): string | null {
+	return ctx.sessionManager.getSessionId?.() ?? null;
 }
 
 function getSessionId(ctx: ExtensionContext): string {
-	return ctx.sessionManager.getSessionId?.() ?? "unknown-session";
+	return getRuntimeSessionId(ctx) ?? "unknown-session";
 }
 
-function clearPendingOpinionatedRequest(sessionId: string, nonce?: number): void {
-	const request = pendingOpinionatedRequests.get(sessionId);
+function clearPendingCompactionRequest(sessionId: string, nonce?: number): void {
+	const request = pendingCompactionRequests.get(sessionId);
 	if (!request) return;
 	if (nonce !== undefined && request.nonce !== nonce) return;
-	pendingOpinionatedRequests.delete(sessionId);
+	pendingCompactionRequests.delete(sessionId);
 }
 
-function armPendingOpinionatedRequest(
+function armPendingCompactionRequest(
 	ctx: ExtensionCommandContext,
+	mode: PendingCompactionRequest["mode"],
 	fallbackThinkingLevel: ThinkingLevel,
 ): { sessionId: string; nonce: number } {
 	const sessionId = getSessionId(ctx);
 	const nonce = nextOpinionatedRequestNonce++;
-	pendingOpinionatedRequests.set(sessionId, {
+	pendingCompactionRequests.set(sessionId, {
 		expiresAt: Date.now() + OPINIONATED_REQUEST_TTL_MS,
 		nonce,
+		mode,
 		fallbackThinkingLevel,
 	});
 	return { sessionId, nonce };
 }
 
-function isPendingOpinionatedRequest(sessionId: string, nonce: number): boolean {
-	return pendingOpinionatedRequests.get(sessionId)?.nonce === nonce;
+function isPendingCompactionRequest(sessionId: string, nonce: number): boolean {
+	return pendingCompactionRequests.get(sessionId)?.nonce === nonce;
 }
 
-function consumeOpinionatedRequest(ctx: ExtensionContext): PendingOpinionatedRequest | null {
+function consumePendingCompactionRequest(ctx: ExtensionContext): PendingCompactionRequest | null {
 	const sessionId = getSessionId(ctx);
-	const request = pendingOpinionatedRequests.get(sessionId);
+	const request = pendingCompactionRequests.get(sessionId);
 	if (!request) return null;
 	if (request.expiresAt < Date.now()) {
-		pendingOpinionatedRequests.delete(sessionId);
+		pendingCompactionRequests.delete(sessionId);
 		return null;
 	}
-	pendingOpinionatedRequests.delete(sessionId);
+	pendingCompactionRequests.delete(sessionId);
 	return request;
 }
 
-function findUniqueFullPayloadIndex(message: EventMessage, fullPayload: EventMessage[]): number | null {
-	const fingerprint = computePayloadFingerprint(message, 0);
-	const matches: number[] = [];
-	for (let i = 0; i < fullPayload.length; i++) {
-		const candidate = computePayloadFingerprint(fullPayload[i], i);
-		if (candidate.role !== fingerprint.role) continue;
-		if (candidate.textPrefix !== fingerprint.textPrefix) continue;
-		if (!sameStringArray(candidate.toolNames, fingerprint.toolNames)) continue;
-		if (candidate.toolCount !== fingerprint.toolCount) continue;
-		matches.push(i);
-	}
-	return matches.length === 1 ? matches[0] : null;
-}
-
-function filterCombinedWithGlobalIds(
-	messages: SegmentedMessage[],
-	payloadPruneIds: Set<string>,
-	protectedIds: Set<string>,
-): { filteredMessages: SegmentedMessage[]; changed: boolean } {
-	let changed = false;
-	const filteredMessages: SegmentedMessage[] = [];
-	for (const msg of messages) {
-		if (msg.role === "toolResult") {
-			const id = getToolResultId(msg);
-			if (id && payloadPruneIds.has(id) && !protectedIds.has(id)) {
-				changed = true;
-				continue;
-			}
-			filteredMessages.push(msg);
-			continue;
-		}
-		if (msg.role === "assistant" && Array.isArray(msg.content)) {
-			const nextContent = msg.content.filter((block) => {
-				const ids = getToolCallBlockIds(block);
-				if (ids.length === 0) return true;
-				return ids.some((id) => !payloadPruneIds.has(id) || protectedIds.has(id));
-			});
-			if (nextContent.length !== msg.content.length) changed = true;
-			if (nextContent.length === 0) {
-				changed = true;
-				continue;
-			}
-			filteredMessages.push(nextContent.length === msg.content.length ? msg : { ...msg, content: nextContent });
-			continue;
-		}
-		filteredMessages.push(msg);
-	}
-	return { filteredMessages, changed };
-}
-
-function filterVisibleSlices(
-	turnPrefixMessages: EventMessage[],
-	messagesToSummarize: EventMessage[],
-): {
-	visibleTurnPrefixMessages: EventMessage[];
-	visibleMessagesToSummarize: EventMessage[];
-	changed: boolean;
-	proof: "before-anchor" | "after-anchor" | "mixed-anchor" | "unproven";
-} {
-	const snapshot = diligentContextRuntime.snapshot;
-	if (!snapshot || !snapshot.state.enabled || snapshot.state.anchorMode === "pending-here" || snapshot.resolvedAnchorIndex === null || !snapshot.rawMessages) {
-		return { visibleTurnPrefixMessages: turnPrefixMessages, visibleMessagesToSummarize: messagesToSummarize, changed: false, proof: "unproven" };
-	}
-	const combined: SegmentedMessage[] = [
-		...messagesToSummarize.map((message) => ({ ...message, __diligentSegment: "delta" as const })),
-		...turnPrefixMessages.map((message) => ({ ...message, __diligentSegment: "prefix" as const })),
-	];
-	if (combined.length === 0) {
-		return { visibleTurnPrefixMessages: turnPrefixMessages, visibleMessagesToSummarize: messagesToSummarize, changed: false, proof: "unproven" };
-	}
-	const firstIndex = findUniqueFullPayloadIndex(combined[0], snapshot.rawMessages);
-	const lastIndex = findUniqueFullPayloadIndex(combined[combined.length - 1], snapshot.rawMessages);
-	if (firstIndex === null || lastIndex === null || firstIndex > lastIndex) {
-		return { visibleTurnPrefixMessages: turnPrefixMessages, visibleMessagesToSummarize: messagesToSummarize, changed: false, proof: "unproven" };
-	}
-	const anchorIndex = snapshot.resolvedAnchorIndex;
-	const isEntireSliceBeforeAnchor = snapshot.state.anchorMode === "after-entry"
-		? lastIndex <= anchorIndex
-		: lastIndex < anchorIndex;
-	const isEntireSliceAfterAnchor = snapshot.state.anchorMode === "after-entry"
-		? firstIndex > anchorIndex
-		: firstIndex >= anchorIndex;
-	if (isEntireSliceAfterAnchor) {
-		return { visibleTurnPrefixMessages: turnPrefixMessages, visibleMessagesToSummarize: messagesToSummarize, changed: false, proof: "after-anchor" };
-	}
-	const proof = isEntireSliceBeforeAnchor ? "before-anchor" : "mixed-anchor";
-	const globalPruneResult = applyPruningAtBoundary(
-		snapshot.rawMessages,
-		anchorIndex,
-		snapshot.state.anchorMode ?? "from-entry",
-	);
-	const localFilterResult = filterCombinedWithGlobalIds(
-		combined,
-		globalPruneResult.payloadPruneIds,
-		globalPruneResult.protectedIds,
-	);
-	const visibleTurnPrefixMessages: EventMessage[] = [];
-	const visibleMessagesToSummarize: EventMessage[] = [];
-	for (const message of localFilterResult.filteredMessages) {
-		const segment = message.__diligentSegment;
-		const cleanMessage = { ...message };
-		delete cleanMessage.__diligentSegment;
-		if (segment === "prefix") {
-			visibleTurnPrefixMessages.push(cleanMessage);
-		} else {
-			visibleMessagesToSummarize.push(cleanMessage);
-		}
-	}
+function createFileOps(): FileOpsLike {
 	return {
-		visibleTurnPrefixMessages,
-		visibleMessagesToSummarize,
-		changed: localFilterResult.changed,
-		proof,
+		read: new Set<string>(),
+		written: new Set<string>(),
+		edited: new Set<string>(),
 	};
 }
 
-function getCurrentAnchorSignature(): string | null {
-	const snapshot = diligentContextRuntime.snapshot;
+function extractFileOpsFromVisibleMessage(message: EventMessage, fileOps: FileOpsLike): void {
+	if (message.role !== "assistant" || !Array.isArray(message.content)) return;
+	for (const block of message.content) {
+		if (!block || typeof block !== "object" || block.type !== "toolCall") continue;
+		const args = (block as { arguments?: unknown }).arguments;
+		if (!args || typeof args !== "object") continue;
+		const pathValue = (args as { path?: unknown }).path;
+		if (typeof pathValue !== "string" || pathValue.length === 0) continue;
+		switch ((block as { name?: unknown }).name) {
+			case "read":
+				fileOps.read.add(pathValue);
+				break;
+			case "write":
+				fileOps.written.add(pathValue);
+				break;
+			case "edit":
+				fileOps.edited.add(pathValue);
+				break;
+		}
+	}
+}
+
+function extractVisibleFileOps(messages: EventMessage[]): FileOpsLike {
+	const fileOps = createFileOps();
+	for (const message of messages) {
+		extractFileOpsFromVisibleMessage(message, fileOps);
+	}
+	return fileOps;
+}
+
+function isResolvedDiligentSnapshot(snapshot: DiligentContextRuntimeSnapshot | null): boolean {
+	return Boolean(
+		snapshot &&
+			snapshot.state.enabled &&
+			snapshot.state.anchorMode !== "pending-here" &&
+			snapshot.resolvedAnchorIndex !== null,
+	);
+}
+
+function getCurrentAnchorSignature(snapshot: DiligentContextRuntimeSnapshot | null): string | null {
 	if (!snapshot || !snapshot.state.enabled || snapshot.state.anchorMode === "pending-here" || snapshot.resolvedAnchorIndex === null || !snapshot.state.anchorFingerprint) {
 		return null;
 	}
@@ -386,61 +400,431 @@ function getCurrentAnchorSignature(): string | null {
 	});
 }
 
-function getLastCompactionDetails(branchEntries: SessionBeforeCompactEvent["branchEntries"]): DiligentCompactionDetails | null {
-	for (let i = branchEntries.length - 1; i >= 0; i--) {
-		const entry = branchEntries[i] as { type?: string; details?: unknown };
-		if (entry.type !== "compaction") continue;
-		if (!entry.details || typeof entry.details !== "object" || Array.isArray(entry.details)) return null;
-		return entry.details as DiligentCompactionDetails;
+type RawContextAlignmentResult =
+	| {
+			ok: true;
+			rawIndexToEntryId: string[];
+			stats: AlignmentStats;
+		}
+	| {
+			ok: false;
+			diagnostic: AlignmentDivergenceDiagnostic;
+		};
+
+function buildAlignmentStats(
+	rawMessages: EventMessage[],
+	contextEntries: ContextMessageEntry[],
+	matchedPrefixCount: number,
+	skippedCustomMessageCount: number,
+): AlignmentStats {
+	return {
+		rawMessageCount: rawMessages.length,
+		contextEntryCount: contextEntries.length,
+		requiredContextEntryCount: contextEntries.filter((entry) => entry.sourceType !== "custom_message").length,
+		matchedPrefixCount,
+		skippedCustomMessageCount,
+	};
+}
+
+function summarizeComparableMessage(
+	index: number,
+	comparable: ContextAlignmentComparable,
+	sourceType?: ContextMessageEntry["sourceType"],
+): DiagnosticMessageSummary {
+	return {
+		index,
+		role: comparable.role,
+		sourceType,
+		customType: comparable.customType,
+		toolResultId: comparable.toolResultId,
+		text: comparable.text,
+		toolNames: comparable.toolNames ? [...comparable.toolNames] : null,
+	};
+}
+
+function summarizeRawMessage(message: EventMessage, index: number): DiagnosticMessageSummary {
+	return summarizeComparableMessage(index, getContextAlignmentComparable(message));
+}
+
+function summarizeContextEntry(entry: ContextMessageEntry, index: number): DiagnosticMessageSummary {
+	return summarizeComparableMessage(index, getContextAlignmentComparable(entry.message), entry.sourceType);
+}
+
+function buildRawWindow(rawMessages: EventMessage[], center: number | null): DiagnosticMessageSummary[] {
+	if (rawMessages.length === 0) return [];
+	const normalizedCenter = center === null ? rawMessages.length - 1 : Math.max(0, Math.min(center, rawMessages.length - 1));
+	const start = Math.max(0, normalizedCenter - 1);
+	const end = Math.min(rawMessages.length, normalizedCenter + 3);
+	const out: DiagnosticMessageSummary[] = [];
+	for (let i = start; i < end; i++) out.push(summarizeRawMessage(rawMessages[i], i));
+	return out;
+}
+
+function buildContextWindow(contextEntries: ContextMessageEntry[], center: number | null): DiagnosticMessageSummary[] {
+	if (contextEntries.length === 0) return [];
+	const normalizedCenter = center === null ? contextEntries.length - 1 : Math.max(0, Math.min(center, contextEntries.length - 1));
+	const start = Math.max(0, normalizedCenter - 1);
+	const end = Math.min(contextEntries.length, normalizedCenter + 3);
+	const out: DiagnosticMessageSummary[] = [];
+	for (let i = start; i < end; i++) out.push(summarizeContextEntry(contextEntries[i], i));
+	return out;
+}
+
+function buildAlignmentDivergenceDiagnostic(args: {
+	kind: AlignmentDivergenceDiagnostic["kind"];
+	rawMessages: EventMessage[];
+	contextEntries: ContextMessageEntry[];
+	matchedPrefixCount: number;
+	skippedCustomMessageCount: number;
+	rawIndex: number | null;
+	contextIndex: number | null;
+	mismatchFields?: ContextAlignmentField[];
+}): AlignmentDivergenceDiagnostic {
+	return {
+		kind: args.kind,
+		stats: buildAlignmentStats(args.rawMessages, args.contextEntries, args.matchedPrefixCount, args.skippedCustomMessageCount),
+		rawIndex: args.rawIndex,
+		contextIndex: args.contextIndex,
+		mismatchFields: args.mismatchFields,
+		rawWindow: buildRawWindow(args.rawMessages, args.rawIndex),
+		contextWindow: buildContextWindow(args.contextEntries, args.contextIndex),
+	};
+}
+
+function alignRawMessagesToContextEntries(
+	rawMessages: EventMessage[],
+	contextEntries: ContextMessageEntry[],
+): RawContextAlignmentResult {
+	const rawIndexToEntryId: string[] = [];
+	let rawIndex = 0;
+	let skippedCustomMessageCount = 0;
+	for (let contextIndex = 0; contextIndex < contextEntries.length; contextIndex++) {
+		const contextEntry = contextEntries[contextIndex];
+		if (rawIndex >= rawMessages.length) {
+			if (contextEntry.sourceType === "custom_message") {
+				skippedCustomMessageCount += 1;
+				continue;
+			}
+			return {
+				ok: false,
+				diagnostic: buildAlignmentDivergenceDiagnostic({
+					kind: "required-context-tail",
+					rawMessages,
+					contextEntries,
+					matchedPrefixCount: rawIndexToEntryId.length,
+					skippedCustomMessageCount,
+					rawIndex,
+					contextIndex,
+				}),
+			};
+		}
+		if (messagesMatchForContextAlignment(contextEntry.message, rawMessages[rawIndex])) {
+			rawIndexToEntryId.push(contextEntry.id);
+			rawIndex += 1;
+			continue;
+		}
+		if (contextEntry.sourceType === "custom_message") {
+			skippedCustomMessageCount += 1;
+			continue;
+		}
+		return {
+			ok: false,
+			diagnostic: buildAlignmentDivergenceDiagnostic({
+				kind: "required-entry-mismatch",
+				rawMessages,
+				contextEntries,
+				matchedPrefixCount: rawIndexToEntryId.length,
+				skippedCustomMessageCount,
+				rawIndex,
+				contextIndex,
+				mismatchFields: getContextAlignmentMismatchFields(contextEntry.message, rawMessages[rawIndex]),
+			}),
+		};
 	}
-	return null;
+	if (rawIndex !== rawMessages.length || rawIndexToEntryId.length !== rawMessages.length) {
+		return {
+			ok: false,
+			diagnostic: buildAlignmentDivergenceDiagnostic({
+				kind: "unmatched-raw-tail",
+				rawMessages,
+				contextEntries,
+				matchedPrefixCount: rawIndexToEntryId.length,
+				skippedCustomMessageCount,
+				rawIndex,
+				contextIndex: contextEntries.length,
+			}),
+		};
+	}
+	return {
+		ok: true,
+		rawIndexToEntryId,
+		stats: buildAlignmentStats(rawMessages, contextEntries, rawIndexToEntryId.length, skippedCustomMessageCount),
+	};
 }
 
-function isPreviousSummarySafeForCurrentAnchor(
-	branchEntries: SessionBeforeCompactEvent["branchEntries"],
-	anchorSignature: string | null,
-): boolean {
-	if (!anchorSignature) return false;
-	const details = getLastCompactionDetails(branchEntries);
-	return details?.diligentContextSummarySafe === true && details.diligentContextAnchorSignature === anchorSignature;
+function getLatestCompactionBranchMetadata(branchEntries: SessionBeforeCompactEvent["branchEntries"]): {
+	compactionEntryId: string | null;
+	firstKeptEntryId: string | null;
+	foundFirstKeptInBranch: boolean | null;
+} {
+	let latestCompactionIndex = -1;
+	let latestCompactionEntry: { id?: unknown; firstKeptEntryId?: unknown; type?: unknown } | null = null;
+	for (let i = 0; i < branchEntries.length; i++) {
+		const entry = branchEntries[i] as { id?: unknown; firstKeptEntryId?: unknown; type?: unknown };
+		if (entry.type === "compaction") {
+			latestCompactionIndex = i;
+			latestCompactionEntry = entry;
+		}
+	}
+	if (!latestCompactionEntry || latestCompactionIndex < 0) {
+		return {
+			compactionEntryId: null,
+			firstKeptEntryId: null,
+			foundFirstKeptInBranch: null,
+		};
+	}
+	const firstKeptEntryId = typeof latestCompactionEntry.firstKeptEntryId === "string"
+		? latestCompactionEntry.firstKeptEntryId
+		: null;
+	const foundFirstKeptInBranch = firstKeptEntryId === null
+		? null
+		: branchEntries.slice(0, latestCompactionIndex).some((entry) => (entry as { id?: unknown }).id === firstKeptEntryId);
+	return {
+		compactionEntryId: typeof latestCompactionEntry.id === "string" ? latestCompactionEntry.id : null,
+		firstKeptEntryId,
+		foundFirstKeptInBranch,
+	};
 }
 
-function buildFilteredPreparation(
+function saveAlignmentDiagnostic(args: {
+	sessionId: string;
+	route: Exclude<CompactionRoute, "native">;
+	blockedReason: "no-live-payload" | "anchor-restoring" | "context-mapping-mismatch" | "nothing-visible-to-compact";
+	blockedMessage: string;
+	diagnostic?: VisiblePreparationFailureDiagnostic;
+	snapshot: DiligentContextRuntimeSnapshot | null;
+	preparation: CompactionPreparation;
+	branchEntries: SessionBeforeCompactEvent["branchEntries"];
+	customInstructions?: string;
+}): string | null {
+	const payload = {
+		kind: args.route === "force-native" ? "alignment_bypass" : "alignment_blocked",
+		timestamp: new Date().toISOString(),
+		sessionId: args.sessionId,
+		route: args.route,
+		blockedReason: args.blockedReason,
+		blockedMessage: args.blockedMessage,
+		diligentState: args.snapshot
+			? {
+				enabled: args.snapshot.state.enabled,
+				anchorMode: args.snapshot.state.anchorMode,
+				resolvedAnchorIndex: args.snapshot.resolvedAnchorIndex,
+			}
+			: null,
+		snapshotCounts: args.snapshot
+			? {
+				rawMessages: args.snapshot.rawMessages?.length ?? 0,
+				filteredMessages: args.snapshot.filteredMessages?.length ?? 0,
+				filteredToRawIndices: args.snapshot.filteredToRawIndices.length,
+			}
+			: null,
+		preparationCounts: {
+			keepRecentTokens: typeof args.preparation.settings?.keepRecentTokens === "number"
+				? args.preparation.settings.keepRecentTokens
+				: null,
+			reserveTokens: typeof args.preparation.settings?.reserveTokens === "number"
+				? args.preparation.settings.reserveTokens
+				: null,
+			messagesToSummarize: args.preparation.messagesToSummarize.length,
+			turnPrefixMessages: args.preparation.turnPrefixMessages.length,
+			isSplitTurn: Boolean(args.preparation.isSplitTurn),
+			customInstructionsPresent: Boolean(args.customInstructions && args.customInstructions.trim().length > 0),
+		},
+		latestCompaction: getLatestCompactionBranchMetadata(args.branchEntries),
+		diagnostic: args.diagnostic ?? null,
+	};
+	try {
+		mkdirSync(COMPACTIONS_DIR, { recursive: true });
+		writeFileSync(LATEST_ALIGNMENT_DIAGNOSTIC_PATH, JSON.stringify(payload, null, 2));
+		if (CONFIG.debugCompactions) {
+			saveCompactionDebug(args.sessionId, payload);
+		}
+		return LATEST_ALIGNMENT_DIAGNOSTIC_PATH;
+	} catch {
+		return null;
+	}
+}
+
+function formatBlockedAlignmentSummary(
+	route: CompactionRoute,
+	diagnostic?: VisiblePreparationFailureDiagnostic,
+): string {
+	const alignment = diagnostic?.kind === "raw-context-alignment-divergence" ? diagnostic.alignment : null;
+	if (!alignment) {
+		return route === "compatibility"
+			? "/compact blocked: live/session alignment failed — diagnostic saved; run /diligent-compact --force-native to compact once without visibility guarantees"
+			: "diligent-compact blocked: live/session alignment failed — diagnostic saved; rerun with /diligent-compact --force-native to compact once without visibility guarantees";
+	}
+	const rawPosition = alignment.rawIndex === null ? "end" : `${alignment.rawIndex + 1}/${alignment.stats.rawMessageCount}`;
+	const mismatch = alignment.mismatchFields && alignment.mismatchFields.length > 0
+		? ` (${alignment.mismatchFields.join(", ")})`
+		: "";
+	const prefix = route === "compatibility" ? "/compact blocked" : "diligent-compact blocked";
+	return `${prefix}: live/session alignment diverged at ${rawPosition}${mismatch} — diagnostic saved; run /diligent-compact --force-native to compact once without visibility guarantees`;
+}
+
+function logBlockedAlignmentDiagnostic(args: {
+	route: CompactionRoute;
+	blockedReason: "no-live-payload" | "anchor-restoring" | "context-mapping-mismatch" | "nothing-visible-to-compact";
+	diagnostic?: VisiblePreparationFailureDiagnostic;
+}): void {
+	if (args.diagnostic?.kind !== "raw-context-alignment-divergence") return;
+	const alignment = args.diagnostic.alignment;
+	const mismatch = alignment.mismatchFields && alignment.mismatchFields.length > 0 ? ` fields=${alignment.mismatchFields.join(",")}` : "";
+	console.log(
+		`[diligent-compact.alignment] route=${args.route} kind=${alignment.kind} matched=${alignment.stats.matchedPrefixCount}/${alignment.stats.rawMessageCount} rawIndex=${alignment.rawIndex ?? "end"} contextIndex=${alignment.contextIndex ?? "end"}${mismatch}`,
+	);
+}
+
+function parseDiligentCompactArgs(args: string): {
+	forceNative: boolean;
+	customInstructions?: string;
+	invalidOption?: string;
+} {
+	const trimmed = args.trim();
+	if (trimmed.length === 0) return { forceNative: false };
+	const [firstToken, ...restTokens] = trimmed.split(/\s+/);
+	if (firstToken === "--force-native") {
+		const rest = restTokens.join(" ").trim();
+		return {
+			forceNative: true,
+			customInstructions: rest.length > 0 ? rest : undefined,
+		};
+	}
+	if (firstToken?.startsWith("--")) {
+		return { forceNative: false, invalidOption: firstToken };
+	}
+	return {
+		forceNative: false,
+		customInstructions: trimmed,
+	};
+}
+
+function findPreferredVisibleCutIndex(messages: EventMessage[], minIndex: number): number {
+	for (let i = minIndex; i < messages.length; i++) {
+		if (getPayloadNarrativeLabel(messages[i]) !== null) return i;
+	}
+	return Math.min(minIndex, messages.length - 1);
+}
+
+function computeFirstKeptVisibleIndex(messages: EventMessage[], keepRecentTokens: number): number {
+	if (messages.length <= 1) return 0;
+	if (!Number.isFinite(keepRecentTokens) || keepRecentTokens <= 0) return 1;
+	let accumulatedTokens = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const messageTokens = estimatePayloadTokens(messages[i]);
+		if (accumulatedTokens + messageTokens > keepRecentTokens) {
+			if (i >= messages.length - 1) return messages.length - 1;
+			return findPreferredVisibleCutIndex(messages, i + 1);
+		}
+		accumulatedTokens += messageTokens;
+	}
+	return 0;
+}
+
+function buildVisiblePreparation(
+	snapshot: DiligentContextRuntimeSnapshot | null,
 	preparation: CompactionPreparation,
 	branchEntries: SessionBeforeCompactEvent["branchEntries"],
-): {
-	filteredPreparation: CompactionPreparation;
-	visibilityChanged: boolean;
-	summaryResetRequired: boolean;
-	anchorSignature: string | null;
-	proof: "before-anchor" | "after-anchor" | "mixed-anchor" | "unproven";
-} {
-	// Cast: Pi's compaction preparation message types are broader than the payload-grounded
-	// diligent-context helpers, but the fields we read overlap safely.
-	const messagesToSummarize = preparation.messagesToSummarize as EventMessage[];
-	const turnPrefixMessages = preparation.turnPrefixMessages as EventMessage[];
-	const { visibleMessagesToSummarize, visibleTurnPrefixMessages, changed, proof } = filterVisibleSlices(
-		turnPrefixMessages,
-		messagesToSummarize,
-	);
-	const anchorSignature = getCurrentAnchorSignature();
-	const summaryResetRequired = Boolean(
-		anchorSignature &&
-			typeof preparation.previousSummary === "string" &&
-			preparation.previousSummary.trim().length > 0 &&
-			!isPreviousSummarySafeForCurrentAnchor(branchEntries, anchorSignature),
-	);
+): VisiblePreparationBuildResult {
+	if (!snapshot?.filteredMessages || snapshot.filteredMessages.length === 0) {
+		return {
+			ok: false,
+			reason: "no-live-payload",
+			message: "no live visible context available yet — send a message first",
+		};
+	}
+	if (snapshot.state.enabled && !isResolvedDiligentSnapshot(snapshot)) {
+		return {
+			ok: false,
+			reason: "anchor-restoring",
+			message: "the current diligent-context boundary is still restoring — send a message first",
+		};
+	}
+	if (!snapshot.rawMessages || snapshot.filteredToRawIndices.length !== snapshot.filteredMessages.length) {
+		return {
+			ok: false,
+			reason: "context-mapping-mismatch",
+			message: "the current live context could not be mapped back to session entries safely",
+			diagnostic: {
+				kind: "filtered-to-raw-length-mismatch",
+				filteredMessageCount: snapshot.filteredMessages.length,
+				filteredToRawCount: snapshot.filteredToRawIndices.length,
+				rawMessageCount: snapshot.rawMessages?.length ?? 0,
+			},
+		};
+	}
+	const contextEntries = buildContextMessageEntries(branchEntries);
+	const alignment = alignRawMessagesToContextEntries(snapshot.rawMessages, contextEntries);
+	if (!alignment.ok) {
+		return {
+			ok: false,
+			reason: "context-mapping-mismatch",
+			message: "the current live context no longer matches the session state safely",
+			diagnostic: {
+				kind: "raw-context-alignment-divergence",
+				alignment: alignment.diagnostic,
+			},
+		};
+	}
+	const rawIndexToEntryId = alignment.rawIndexToEntryId;
+	const keepRecentTokens = typeof preparation.settings?.keepRecentTokens === "number" && Number.isFinite(preparation.settings.keepRecentTokens)
+		? Math.max(0, Math.floor(preparation.settings.keepRecentTokens))
+		: 0;
+	const firstKeptVisibleIndex = computeFirstKeptVisibleIndex(snapshot.filteredMessages, keepRecentTokens);
+	if (firstKeptVisibleIndex <= 0) {
+		return {
+			ok: false,
+			reason: "nothing-visible-to-compact",
+			message: "nothing visible to compact yet within the current live context",
+		};
+	}
+	const firstKeptRawIndex = snapshot.filteredToRawIndices[firstKeptVisibleIndex];
+	const firstKeptEntryId = typeof firstKeptRawIndex === "number" ? rawIndexToEntryId[firstKeptRawIndex] : undefined;
+	if (typeof firstKeptEntryId !== "string" || firstKeptEntryId.length === 0) {
+		return {
+			ok: false,
+			reason: "context-mapping-mismatch",
+			message: "the visible compaction boundary could not be mapped back to session entries safely",
+			diagnostic: {
+				kind: "first-kept-entry-id-missing",
+				firstKeptVisibleIndex,
+				firstKeptRawIndex: typeof firstKeptRawIndex === "number" ? firstKeptRawIndex : null,
+				rawMessageCount: snapshot.rawMessages.length,
+				mappingCount: rawIndexToEntryId.length,
+			},
+		};
+	}
+	const messagesToSummarize = snapshot.filteredMessages.slice(0, firstKeptVisibleIndex);
+	const totalVisibleMessages = snapshot.filteredMessages.length;
+	const summarizedVisibleMessages = messagesToSummarize.length;
+	const keptVisibleMessages = totalVisibleMessages - summarizedVisibleMessages;
 	return {
-		filteredPreparation: {
+		ok: true,
+		preparation: {
 			...preparation,
-			previousSummary: summaryResetRequired ? undefined : preparation.previousSummary,
-			messagesToSummarize: visibleMessagesToSummarize,
-			turnPrefixMessages: visibleTurnPrefixMessages,
+			firstKeptEntryId,
+			messagesToSummarize,
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			previousSummary: undefined,
+			tokensBefore: estimatePayloadTokens(snapshot.filteredMessages),
+			fileOps: extractVisibleFileOps(messagesToSummarize) as CompactionPreparation["fileOps"],
 		},
-		visibilityChanged: changed,
-		summaryResetRequired,
-		anchorSignature,
-		proof,
+		anchorSignature: getCurrentAnchorSignature(snapshot),
+		totalVisibleMessages,
+		summarizedVisibleMessages,
+		keptVisibleMessages,
 	};
 }
 
@@ -448,7 +832,6 @@ function attachDiligentDetails(
 	result: CompactionResult,
 	route: Exclude<CompactionRoute, "native">,
 	anchorSignature: string | null,
-	summarySafe: boolean,
 ): CompactionResult {
 	const baseDetails = result.details;
 	const detailObject = baseDetails && typeof baseDetails === "object" && !Array.isArray(baseDetails)
@@ -462,31 +845,8 @@ function attachDiligentDetails(
 			...detailObject,
 			route,
 			diligentContextAnchorSignature: anchorSignature ?? undefined,
-			diligentContextSummarySafe: summarySafe,
 		},
 	};
-}
-
-function buildVisibleSummaryCarryForwardCompaction(
-	preparation: CompactionPreparation,
-	route: Exclude<CompactionRoute, "native">,
-	anchorSignature: string | null,
-	summarySafe: boolean,
-): CompactionResult {
-	const priorSummary = typeof preparation.previousSummary === "string" && preparation.previousSummary.trim().length > 0
-		? preparation.previousSummary
-		: VISIBILITY_RESET_SUMMARY;
-	return attachDiligentDetails(
-		{
-			summary: priorSummary,
-			firstKeptEntryId: preparation.firstKeptEntryId,
-			tokensBefore: preparation.tokensBefore,
-			details: {},
-		},
-		route,
-		anchorSignature,
-		summarySafe,
-	);
 }
 
 function notify(ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info"): void {
@@ -782,11 +1142,7 @@ async function runOpinionatedCompaction(args: {
 
 	notify(
 		args.ctx,
-		`diligent-compact: compacting ${args.preparation.messagesToSummarize.length} visible messages` +
-			(isSplitTurn && args.preparation.turnPrefixMessages.length > 0
-				? ` (+${args.preparation.turnPrefixMessages.length} visible split-turn prefix)`
-				: "") +
-			` with ${selected.model.provider}/${selected.model.id} (thinking: ${selected.thinkingLevel})`,
+		`diligent-compact: compacting ${args.preparation.messagesToSummarize.length} visible messages with ${selected.model.provider}/${selected.model.id} (thinking: ${selected.thinkingLevel})`,
 		"info",
 	);
 
@@ -879,35 +1235,59 @@ async function runOpinionatedCompaction(args: {
 
 export default function diligentCompactExtension(pi: ExtensionAPI) {
 	pi.registerCommand("diligent-compact", {
-		description: "Run opinionated visibility-aware compaction. Usage: /diligent-compact [instructions]",
+		description: "Run visibility-aware compaction. Usage: /diligent-compact [instructions] or /diligent-compact --force-native [instructions]",
 		handler: async (args, ctx) => {
-			const { sessionId, nonce } = armPendingOpinionatedRequest(ctx, pi.getThinkingLevel());
+			const parsed = parseDiligentCompactArgs(args);
+			if (parsed.invalidOption) {
+				notify(ctx, `diligent-compact: unknown option ${parsed.invalidOption}`, "warning");
+				return;
+			}
+			const mode: PendingCompactionRequest["mode"] = parsed.forceNative ? "force-native" : "opinionated";
+			const { sessionId, nonce } = armPendingCompactionRequest(ctx, mode, pi.getThinkingLevel());
 			clearCompactionSummaryWidget(ctx);
-			setCompactionStatus(ctx, "diligent-compact: running");
+			setCompactionStatus(
+				ctx,
+				mode === "force-native" ? "diligent-compact: native override (unsafe)" : "diligent-compact: running",
+			);
+			if (mode === "force-native") {
+				notify(
+					ctx,
+					"diligent-compact: using native Pi compaction for this run — diligent visibility guarantees are suspended",
+					"warning",
+				);
+			}
 			try {
 				ctx.compact({
-					customInstructions: args.trim() || undefined,
+					customInstructions: parsed.customInstructions,
 					onComplete: (result) => {
-						clearPendingOpinionatedRequest(sessionId, nonce);
+						clearPendingCompactionRequest(sessionId, nonce);
 						setCompactionStatus(ctx, undefined);
 						notify(
 							ctx,
-							`diligent-compact complete: visible context checkpoint saved (${formatTokens(result.tokensBefore)} before compaction)`,
+							mode === "force-native"
+								? `diligent-compact complete: native compaction finished (${formatTokens(result.tokensBefore)} before compaction) — visibility guarantees were bypassed for this run`
+								: `diligent-compact complete: visible context checkpoint saved (${formatTokens(result.tokensBefore)} before compaction)`,
 							"info",
 						);
 					},
 					onError: (error) => {
-						const shouldNotify = isPendingOpinionatedRequest(sessionId, nonce);
-						clearPendingOpinionatedRequest(sessionId, nonce);
+						const shouldNotify = mode === "force-native" ? true : isPendingCompactionRequest(sessionId, nonce);
+						clearPendingCompactionRequest(sessionId, nonce);
 						setCompactionStatus(ctx, undefined);
 						if (!shouldNotify) return;
 						const message = error instanceof Error ? error.message : String(error);
 						if (message === "Compaction cancelled") return;
-						notify(ctx, `diligent-compact failed: ${message}`, "warning");
+						notify(
+							ctx,
+							mode === "force-native"
+								? `diligent-compact native override failed: ${message}`
+								: `diligent-compact failed: ${message}`,
+							"warning",
+						);
 					},
 				});
 			} catch (error) {
-				clearPendingOpinionatedRequest(sessionId, nonce);
+				clearPendingCompactionRequest(sessionId, nonce);
 				setCompactionStatus(ctx, undefined);
 				throw error;
 			}
@@ -941,18 +1321,18 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		const { preparation, branchEntries, signal, customInstructions } = event as SessionBeforeCompactEvent;
+		const runtimeSessionId = getRuntimeSessionId(ctx);
 		const sessionId = getSessionId(ctx);
-		const { filteredPreparation, visibilityChanged, summaryResetRequired, anchorSignature, proof } = buildFilteredPreparation(preparation, branchEntries);
-		const opinionatedRequest = consumeOpinionatedRequest(ctx);
-		const route: CompactionRoute = opinionatedRequest
-			? "opinionated"
-			: anchorSignature !== null
-				? "compatibility"
-				: "native";
-
-		debugLog(
-			`route=${route} proof=${proof} visibilityChanged=${visibilityChanged} summaryResetRequired=${summaryResetRequired} anchorActive=${anchorSignature !== null} delta=${preparation.messagesToSummarize.length}->${filteredPreparation.messagesToSummarize.length} prefix=${preparation.turnPrefixMessages.length}->${filteredPreparation.turnPrefixMessages.length}`,
-		);
+		const pendingRequest = consumePendingCompactionRequest(ctx);
+		const runtimeSnapshot = getDiligentContextRuntimeSnapshot(runtimeSessionId);
+		const diligentState = runtimeSnapshot?.state ?? loadStateFromEntries(branchEntries as SessionEntry[]);
+		const route: CompactionRoute = pendingRequest?.mode === "force-native"
+			? "force-native"
+			: pendingRequest?.mode === "opinionated"
+				? "opinionated"
+				: diligentState.enabled
+					? "compatibility"
+					: "native";
 
 		if (signal.aborted) {
 			debugLog("Compaction aborted before start");
@@ -962,55 +1342,87 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 		if (route === "native") {
 			return undefined;
 		}
-		if (anchorSignature !== null && proof === "unproven") {
+
+		const visiblePreparation = buildVisiblePreparation(runtimeSnapshot, preparation, branchEntries);
+		if (route === "force-native") {
+			if (isVisiblePreparationFailure(visiblePreparation)) {
+				const artifactPath = visiblePreparation.reason === "context-mapping-mismatch"
+					? saveAlignmentDiagnostic({
+						sessionId,
+						route,
+						blockedReason: visiblePreparation.reason,
+						blockedMessage: visiblePreparation.message,
+						diagnostic: visiblePreparation.diagnostic,
+						snapshot: runtimeSnapshot,
+						preparation,
+						branchEntries,
+						customInstructions,
+					})
+					: null;
+				logBlockedAlignmentDiagnostic({
+					route,
+					blockedReason: visiblePreparation.reason,
+					diagnostic: visiblePreparation.diagnostic,
+				});
+				debugLog(`route=force-native bypass blocked=${visiblePreparation.reason}${artifactPath ? ` artifact=${artifactPath}` : ""}`);
+			}
+			return undefined;
+		}
+
+		if (isVisiblePreparationFailure(visiblePreparation)) {
+			const blockedMessage = visiblePreparation.message;
+			const blockedReason = visiblePreparation.reason;
+			const artifactPath = blockedReason === "context-mapping-mismatch"
+				? saveAlignmentDiagnostic({
+					sessionId,
+					route,
+					blockedReason,
+					blockedMessage,
+					diagnostic: visiblePreparation.diagnostic,
+					snapshot: runtimeSnapshot,
+					preparation,
+					branchEntries,
+					customInstructions,
+				})
+				: null;
+			logBlockedAlignmentDiagnostic({ route, blockedReason, diagnostic: visiblePreparation.diagnostic });
 			notify(
 				ctx,
-				route === "opinionated"
-					? "diligent-compact blocked: the current diligent-context boundary could not be proven safely for this compaction slice"
-					: "/compact blocked: the current diligent-context boundary could not be proven safely for this compaction slice",
+				blockedReason === "context-mapping-mismatch"
+					? formatBlockedAlignmentSummary(route, visiblePreparation.diagnostic)
+					: route === "opinionated"
+						? `diligent-compact blocked: ${blockedMessage}`
+						: `/compact blocked: ${blockedMessage}`,
 				"warning",
 			);
+			debugLog(`route=${route} blocked=${blockedReason}${artifactPath ? ` artifact=${artifactPath}` : ""}`);
 			return { cancel: true };
 		}
 
-		if (
-			filteredPreparation.messagesToSummarize.length === 0 &&
-			filteredPreparation.turnPrefixMessages.length === 0
-		) {
-			if (summaryResetRequired) {
-				notify(ctx, "diligent-compact: resetting stale pre-anchor summary to keep hidden context out of future compactions", "info");
-			} else if (route === "compatibility") {
-				notify(ctx, "diligent-compact: carrying forward the existing visible summary while compacting hidden-only context", "info");
-			}
-			return {
-				compaction: buildVisibleSummaryCarryForwardCompaction(
-					filteredPreparation,
-					route,
-					anchorSignature,
-					proof !== "unproven",
-				),
-			};
-		}
+		const { preparation: visibleCompactionPreparation, anchorSignature, totalVisibleMessages, summarizedVisibleMessages, keptVisibleMessages } = visiblePreparation;
+		debugLog(
+			`route=${route} visibleTotal=${totalVisibleMessages} summarize=${summarizedVisibleMessages} keep=${keptVisibleMessages} firstKept=${visibleCompactionPreparation.firstKeptEntryId}`,
+		);
 
 		try {
 			const result = route === "opinionated"
 				? await runOpinionatedCompaction({
 					ctx,
-					preparation: filteredPreparation,
+					preparation: visibleCompactionPreparation,
 					customInstructions,
 					signal,
 					sessionId,
-					fallbackThinkingLevel: opinionatedRequest?.fallbackThinkingLevel ?? CONFIG.thinkingLevel,
+					fallbackThinkingLevel: pendingRequest?.fallbackThinkingLevel ?? CONFIG.thinkingLevel,
 				})
 				: await runCompatibilityCompaction({
 					ctx,
-					preparation: filteredPreparation,
+					preparation: visibleCompactionPreparation,
 					customInstructions,
 					signal,
 					sessionId,
 				});
 
-			return { compaction: attachDiligentDetails(result, route, anchorSignature, proof !== "unproven") };
+			return { compaction: attachDiligentDetails(result, route, anchorSignature) };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (signal.aborted || message === "Compaction cancelled") {
@@ -1019,14 +1431,13 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 			if (route === "compatibility") {
 				notify(
 					ctx,
-					`/compact blocked: visibility-aware compaction failed (${message}). Hidden context was preserved.`,
+					`/compact blocked: visibility-aware compaction failed (${message}). The current live context was preserved.`,
 					"warning",
 				);
 				saveCompactionDebug(sessionId, {
 					kind: "compatibility_error",
 					error: message,
-					messagesToSummarizeCount: filteredPreparation.messagesToSummarize.length,
-					turnPrefixMessagesCount: filteredPreparation.turnPrefixMessages.length,
+					visibleMessagesCount: visibleCompactionPreparation.messagesToSummarize.length,
 					customInstructionsPresent: Boolean(customInstructions),
 				});
 				return { cancel: true };
@@ -1036,8 +1447,7 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 			saveCompactionDebug(sessionId, {
 				kind: "opinionated_error",
 				error: message,
-				messagesToSummarizeCount: filteredPreparation.messagesToSummarize.length,
-				turnPrefixMessagesCount: filteredPreparation.turnPrefixMessages.length,
+				visibleMessagesCount: visibleCompactionPreparation.messagesToSummarize.length,
 				customInstructionsPresent: Boolean(customInstructions),
 			});
 			return { cancel: true };

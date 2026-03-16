@@ -64,17 +64,58 @@ export type PayloadDiagnostics = {
 export type DiligentContextRuntimeSnapshot = {
 	state: DiligentContextState;
 	rawMessages: EventMessage[] | null;
+	filteredMessages: EventMessage[] | null;
+	filteredToRawIndices: number[];
 	resolvedAnchorIndex: number | null;
 };
 
-export const diligentContextRuntime: {
-	snapshot: DiligentContextRuntimeSnapshot | null;
-} = {
-	snapshot: null,
+export type ContextMessageSourceType = "message" | "custom_message" | "branch_summary" | "compaction";
+
+export type ContextMessageEntry = {
+	id: string;
+	sourceType: ContextMessageSourceType;
+	message: EventMessage;
 };
 
-export function setDiligentContextRuntimeSnapshot(snapshot: DiligentContextRuntimeSnapshot | null): void {
-	diligentContextRuntime.snapshot = snapshot;
+type DiligentContextRuntimeStore = {
+	sessionId: string | null;
+	snapshot: DiligentContextRuntimeSnapshot | null;
+};
+
+const DILIGENT_CONTEXT_RUNTIME_KEY = Symbol.for("pi.extensions.diligent-context.runtime.v1");
+
+function getDiligentContextRuntimeStore(): DiligentContextRuntimeStore {
+	const globalStore = globalThis as typeof globalThis & {
+		[DILIGENT_CONTEXT_RUNTIME_KEY]?: DiligentContextRuntimeStore;
+	};
+	const existing = globalStore[DILIGENT_CONTEXT_RUNTIME_KEY];
+	if (existing) return existing;
+	const created: DiligentContextRuntimeStore = {
+		sessionId: null,
+		snapshot: null,
+	};
+	globalStore[DILIGENT_CONTEXT_RUNTIME_KEY] = created;
+	return created;
+}
+
+export function getDiligentContextRuntimeSnapshot(sessionId: string | null | undefined): DiligentContextRuntimeSnapshot | null {
+	if (!sessionId) return null;
+	const store = getDiligentContextRuntimeStore();
+	return store.sessionId === sessionId ? store.snapshot : null;
+}
+
+export function setDiligentContextRuntimeSnapshot(
+	sessionId: string | null | undefined,
+	snapshot: DiligentContextRuntimeSnapshot | null,
+): void {
+	const store = getDiligentContextRuntimeStore();
+	if (!sessionId) {
+		store.sessionId = null;
+		store.snapshot = null;
+		return;
+	}
+	store.sessionId = sessionId;
+	store.snapshot = snapshot;
 }
 
 export const OFF_STATE: DiligentContextState = {
@@ -82,6 +123,120 @@ export const OFF_STATE: DiligentContextState = {
 	anchorMode: null,
 	anchorFingerprint: null,
 };
+
+export function createContextMessageEntry(entry: SessionEntry): ContextMessageEntry | null {
+	const base = entry as {
+		id?: unknown;
+		type?: unknown;
+		timestamp?: unknown;
+		message?: unknown;
+		customType?: unknown;
+		content?: unknown;
+		display?: unknown;
+		details?: unknown;
+		summary?: unknown;
+		fromId?: unknown;
+	};
+	if (typeof base.id !== "string") return null;
+	const timestamp = typeof base.timestamp === "string" ? new Date(base.timestamp).getTime() : Date.now();
+	if (base.type === "message") {
+		if (!base.message || typeof base.message !== "object") return null;
+		return {
+			id: base.id,
+			sourceType: "message",
+			message: base.message as EventMessage,
+		};
+	}
+	if (base.type === "custom_message") {
+		return {
+			id: base.id,
+			sourceType: "custom_message",
+			message: {
+				role: "custom",
+				customType: getString(base.customType) ?? undefined,
+				content: typeof base.content === "string" || Array.isArray(base.content) ? base.content : undefined,
+				display: typeof base.display === "boolean" ? base.display : undefined,
+				details: base.details,
+				timestamp,
+			},
+		};
+	}
+	if (base.type === "branch_summary") {
+		if (typeof base.summary !== "string") return null;
+		return {
+			id: base.id,
+			sourceType: "branch_summary",
+			message: {
+				role: "branchSummary",
+				summary: base.summary,
+				fromId: getString(base.fromId) ?? undefined,
+				timestamp,
+			},
+		};
+	}
+	return null;
+}
+
+export function buildContextMessageEntries(branchEntries: SessionEntry[]): ContextMessageEntry[] {
+	const entries: ContextMessageEntry[] = [];
+	let latestCompactionIndex = -1;
+	let latestCompactionEntry: {
+		id?: unknown;
+		firstKeptEntryId?: unknown;
+		summary?: unknown;
+		tokensBefore?: unknown;
+		timestamp?: unknown;
+		type?: unknown;
+	} | null = null;
+	for (let i = 0; i < branchEntries.length; i++) {
+		const entry = branchEntries[i] as {
+			type?: unknown;
+			id?: unknown;
+			firstKeptEntryId?: unknown;
+			summary?: unknown;
+			tokensBefore?: unknown;
+			timestamp?: unknown;
+		};
+		if (entry.type === "compaction") {
+			latestCompactionIndex = i;
+			latestCompactionEntry = entry;
+		}
+	}
+	if (latestCompactionIndex >= 0 && latestCompactionEntry && latestCompactionEntry.type === "compaction" && typeof latestCompactionEntry.id === "string") {
+		entries.push({
+			id: latestCompactionEntry.id,
+			sourceType: "compaction",
+			message: {
+				role: "compactionSummary",
+				summary: typeof latestCompactionEntry.summary === "string" ? latestCompactionEntry.summary : "",
+				tokensBefore: typeof latestCompactionEntry.tokensBefore === "number" ? latestCompactionEntry.tokensBefore : 0,
+				timestamp: typeof latestCompactionEntry.timestamp === "string"
+					? new Date(latestCompactionEntry.timestamp).getTime()
+					: Date.now(),
+			},
+		});
+		let foundFirstKept = false;
+		for (let i = 0; i < latestCompactionIndex; i++) {
+			const entry = branchEntries[i] as { id?: unknown };
+			if (entry.id === latestCompactionEntry.firstKeptEntryId) {
+				foundFirstKept = true;
+			}
+			if (!foundFirstKept) continue;
+			const messageEntry = createContextMessageEntry(branchEntries[i]);
+			if (messageEntry) entries.push(messageEntry);
+		}
+		for (let i = latestCompactionIndex + 1; i < branchEntries.length; i++) {
+			const messageEntry = createContextMessageEntry(branchEntries[i]);
+			if (messageEntry) entries.push(messageEntry);
+		}
+		return entries;
+	}
+	for (const entry of branchEntries) {
+		const messageEntry = createContextMessageEntry(entry);
+		if (messageEntry) entries.push(messageEntry);
+	}
+	return entries;
+}
 
 export function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
@@ -155,6 +310,128 @@ export function getThinkingBlocks(content: string | ContentBlock[] | undefined):
 		if (block.type === "redacted_thinking") out.push("[redacted thinking]");
 	}
 	return out;
+}
+
+function getComparableText(msg: EventMessage): string | null {
+	const summary = getString((msg as { summary?: unknown }).summary);
+	if (summary) return truncate(summary, FINGERPRINT_TEXT_LIMIT);
+	return getTextBlocks(msg.content)[0] ?? getThinkingBlocks(msg.content)[0] ?? null;
+}
+
+function getComparableCustomType(msg: EventMessage): string | null {
+	return getString((msg as { customType?: unknown }).customType);
+}
+
+function getComparableToolNames(msg: EventMessage): string[] | null {
+	const names = getToolCallNames(msg.content);
+	return names.length > 0 ? [...names].sort() : null;
+}
+
+function sameStringArray(a: string[] | null, b: string[] | null): boolean {
+	if (a === null || b === null) return a === b;
+	if (a.length !== b.length) return false;
+	return a.every((value, index) => value === b[index]);
+}
+
+export type ContextAlignmentField = "role" | "customType" | "toolResultId" | "text" | "toolNames";
+
+export type ContextAlignmentComparable = {
+	role: string | null;
+	customType: string | null;
+	toolResultId: string | null;
+	text: string | null;
+	toolNames: string[] | null;
+};
+
+export function getContextAlignmentComparable(message: EventMessage): ContextAlignmentComparable {
+	return {
+		role: getString(message.role),
+		customType: getComparableCustomType(message),
+		toolResultId: getToolResultId(message),
+		text: getComparableText(message),
+		toolNames: getComparableToolNames(message),
+	};
+}
+
+export function getContextAlignmentMismatchFields(expected: EventMessage, actual: EventMessage): ContextAlignmentField[] {
+	const expectedComparable = getContextAlignmentComparable(expected);
+	const actualComparable = getContextAlignmentComparable(actual);
+	const mismatches: ContextAlignmentField[] = [];
+	if (!expectedComparable.role || expectedComparable.role !== actualComparable.role) mismatches.push("role");
+	if (
+		(expectedComparable.customType !== null || actualComparable.customType !== null) &&
+		expectedComparable.customType !== actualComparable.customType
+	) {
+		mismatches.push("customType");
+	}
+	if (
+		(expectedComparable.toolResultId !== null || actualComparable.toolResultId !== null) &&
+		expectedComparable.toolResultId !== actualComparable.toolResultId
+	) {
+		mismatches.push("toolResultId");
+	}
+	if ((expectedComparable.text !== null || actualComparable.text !== null) && expectedComparable.text !== actualComparable.text) {
+		mismatches.push("text");
+	}
+	if (
+		(expectedComparable.toolNames !== null || actualComparable.toolNames !== null) &&
+		!sameStringArray(expectedComparable.toolNames, actualComparable.toolNames)
+	) {
+		mismatches.push("toolNames");
+	}
+	return mismatches;
+}
+
+function stableJsonStringify(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) {
+		return `[${value.map((item) => stableJsonStringify(item)).join(",")}]`;
+	}
+	const entries = Object.entries(value as Record<string, unknown>)
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJsonStringify(entryValue)}`);
+	return `{${entries.join(",")}}`;
+}
+
+function normalizeContentForContextAlignment(content: EventMessage["content"]): unknown {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return null;
+	return content.map((block) => {
+		if (!isObject(block)) return block ?? null;
+		const type = getString(block.type) ?? null;
+		if (type === "text") {
+			return { type, text: String((block as TextBlock).text ?? "") };
+		}
+		if (type === "thinking") {
+			return { type, thinking: String((block as ThinkingBlock).thinking ?? "") };
+		}
+		if (type === "redacted_thinking") {
+			return { type };
+		}
+		if (type === "toolCall") {
+			return {
+				type,
+				ids: getToolCallBlockIds(block),
+				name: getString((block as { name?: unknown }).name),
+				arguments: (block as { arguments?: unknown }).arguments ?? null,
+			};
+		}
+		return Object.fromEntries(Object.entries(block).sort(([a], [b]) => a.localeCompare(b)));
+	});
+}
+
+function getExactContextAlignmentSignature(message: EventMessage): string {
+	return stableJsonStringify({
+		role: getString(message.role),
+		customType: getComparableCustomType(message),
+		toolResultId: getToolResultId(message),
+		summary: getString((message as { summary?: unknown }).summary),
+		content: normalizeContentForContextAlignment(message.content),
+	});
+}
+
+export function messagesMatchForContextAlignment(expected: EventMessage, actual: EventMessage): boolean {
+	return getExactContextAlignmentSignature(expected) === getExactContextAlignmentSignature(actual);
 }
 
 export function getToolCallBlockIds(block: ContentBlock): string[] {
@@ -366,7 +643,7 @@ export function getPayloadNarrativeLabel(msg: EventMessage): string | null {
 		return null;
 	}
 	if (msg.role === "compactionSummary") {
-		const text = getTextBlocks(msg.content)[0];
+		const text = getString((msg as { summary?: unknown }).summary);
 		return text ? `🗜 ${truncate(text)}` : null;
 	}
 	return null;
