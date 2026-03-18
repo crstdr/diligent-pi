@@ -1,7 +1,7 @@
 {
   "compactionModels": [
-    { "provider": "openai-codex", "id": "gpt-5.4" },
-    { "provider": "anthropic", "id": "claude-opus-4-6" }
+    { "provider": "anthropic", "id": "claude-opus-4-6" },
+    { "provider": "openai-codex", "id": "gpt-5.4" }
   ],
   "thinkingLevel": "xhigh",
   "debugCompactions": false
