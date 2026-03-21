@@ -65,6 +65,19 @@ So for now:
 - `diligent-contemplate` produces semantic contemplation checkpoints that `diligent-context` persists and projects
 - no extension depends on a Pi-core assistant-message persistence API
 
+## Local workflow
+
+Committed local changes from `diligent-pi` are copied into your user-level Pi extensions install by your local process.
+
+Recommended local workflow:
+
+1. work in this repo
+2. commit in `diligent-pi`
+3. test from the user-level Pi extensions install before pushing upstream
+
+This intentionally propagates **committed local changes only**.
+Uncommitted work stays local until you make it a real checkpoint via commit.
+
 ## Notes
 
 These extensions are stable enough to use, but the structure may still evolve as the architecture is refined.
