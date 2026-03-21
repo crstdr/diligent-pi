@@ -2,6 +2,9 @@
 
 A small collection of Pi extensions focused on **careful context shaping** rather than maximal automation.
 
+This repo is the **canonical source of truth** for the diligent extensions.
+Downstream consumers should vendor from here rather than evolving their own divergent copies.
+
 Current extensions:
 
 - **diligent-context** — hide stale tool chatter from the live payload while preserving the human conversation
@@ -41,6 +44,20 @@ cp -R extensions/diligent-compact ~/.pi/agent/extensions/
 - `/compact`
 - `/diligent-compact [instructions]`
 - `/diligent-compact --force-native [instructions]`
+
+## Downstream workflow
+
+Downstream consumers can sync from the local committed `diligent-pi` `HEAD`.
+
+Recommended local workflow:
+
+1. work in this repo
+2. commit in `diligent-pi`
+3. sync the committed state into your downstream consumer or extension install
+4. test before pushing upstream
+
+This intentionally syncs **committed local changes only**.
+Uncommitted work is excluded so downstream testing stays reproducible.
 
 ## Notes
 
