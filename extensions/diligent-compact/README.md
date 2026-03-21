@@ -14,11 +14,11 @@ If compaction summarized a larger historical backlog than the model currently se
 - hit prompt-size failures even when the live context still fits
 - reintroduce hidden tool churn as visible summary text
 
-So `diligent-compact` uses the **current live visible payload** as the compaction universe when compaction is extension-managed.
+So `diligent-compact` uses the **current diligent-visible live payload** as the compaction universe when compaction is extension-managed.
 
 ## Routing model
 
-On `session_before_compact`, the extension chooses one of three routes:
+On `session_before_compact`, the extension chooses one of four routes:
 
 ### 1. Native
 If `diligent-context` is off and no explicit `/diligent-compact` request is active:
@@ -30,15 +30,20 @@ If `diligent-context` is active:
 - the extension builds a synthetic compaction preparation from the **current diligent-visible live payload**
 - summarizes only the older visible prefix
 - keeps the recent visible suffix untouched
+- carries any active diligent checkpoints forward as structured summary input
 - then calls Pi's exported native `compact(...)` helper on that synthetic preparation
-
-This keeps `/compact` as the default command while making compaction see the same universe as normal model usage.
 
 ### 3. Opinionated
 If the user explicitly runs `/diligent-compact`:
 - the extension arms a one-shot request
 - triggers compaction via `ctx.compact(...)`
 - then compacts the same live visible payload universe with its configured model/prompt/thinking stack
+- active diligent checkpoints are supplied as structured carry-forward input, not as ordinary chat history
+
+### 4. Force-native
+`/diligent-compact --force-native` bypasses diligent visibility guarantees for one run.
+
+This is the explicit escape hatch when visibility-aware alignment fails on an older or unusual session.
 
 ## Commands
 
@@ -55,20 +60,16 @@ Any trailing text is forwarded as compaction focus instructions.
 ### `/diligent-compact --force-native [instructions]`
 Run one explicit degraded native compaction.
 
-This is the escape hatch when visibility-aware alignment fails on an older or unusual session. It deliberately bypasses diligent-context visibility guarantees for that one compaction run, so hidden pre-anchor context may be summarized.
+## Checkpoint carry-forward
 
-## Live-payload rule
+Active diligent checkpoints are **not** treated as ordinary message history for compaction.
 
-When compaction is extension-managed, the source universe is:
+Instead:
+- the runtime snapshot stays grounded in real payload only
+- active checkpoints are provided through `previousSummary`-style carry-forward input
+- any successful compaction clears active checkpoints afterward
 
-- the current `diligent-context` filtered live payload
-
-That means:
-- no slice-proof classification
-- no fingerprint-matching backlog slices back into the payload
-- no separate `previousSummary` carry-forward in diligent-visible mode
-
-If a previous compaction summary is still visible, it is already part of the live payload and will be summarized like any other visible message.
+This prevents summary-of-summary drift while preserving semantic continuity.
 
 ## Prompt
 
@@ -84,20 +85,7 @@ Edit:
 
 - `extensions/diligent-compact/config.json`
 
-Example:
-
-```json
-{
-  "compactionModels": [
-    { "provider": "openai-codex", "id": "gpt-5.4" },
-    { "provider": "anthropic", "id": "claude-opus-4-6" }
-  ],
-  "thinkingLevel": "xhigh",
-  "debugCompactions": false
-}
-```
-
-`config.json` affects the explicit `/diligent-compact` path.
+`config.json` affects the explicit `/diligent-compact` path and the shared opinionated stack used by `/diligent-contemplate`.
 The compatibility route behind `/compact` uses the current session model so it stays close to Pi's native compaction behavior.
 
 ## Failure posture
@@ -118,5 +106,3 @@ When live/session alignment fails, the extension always writes the latest diverg
 If `debugCompactions` is enabled, additional timestamped artifacts are also written to:
 
 - `~/.pi/agent/extensions/diligent-compact/compactions/`
-
-(Artifacts can still contain sensitive conversation material; treat them as sensitive and do not share.)

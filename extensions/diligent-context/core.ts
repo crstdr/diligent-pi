@@ -1,25 +1,44 @@
 import { estimateTokens, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 export const DILIGENT_CONTEXT_CUSTOM_TYPE = "diligent-context-state";
+export const DILIGENT_CHECKPOINT_CUSTOM_TYPE = "diligent-context-checkpoint";
 export const DILIGENT_CONTEXT_STATUS_KEY = "diligent-context";
 const ENTRY_PREVIEW_LIMIT = 60;
 const FINGERPRINT_TEXT_LIMIT = 120;
 const FINGERPRINT_MATCH_THRESHOLD = 3;
 
 export type AnchorMode = "from-entry" | "after-entry" | "pending-here";
+export type CheckpointKind = "provenance" | "contemplation";
 
 export type AnchorFingerprint = {
 	role: string;
 	textPrefix: string | null;
 	toolNames: string[] | null;
 	toolCount: number;
+	toolResultId?: string | null;
 	payloadIndex: number;
+};
+
+export type DiligentCheckpointArtifact = {
+	id: string;
+	kind: CheckpointKind;
+	body: string;
+	createdAt: string;
+	provider?: string;
+	model?: string;
+	visibleMessageCount?: number;
+};
+
+export type DiligentContextCheckpoints = {
+	provenance: DiligentCheckpointArtifact | null;
+	contemplation: DiligentCheckpointArtifact | null;
 };
 
 export type DiligentContextState = {
 	enabled: boolean;
 	anchorMode: AnchorMode | null;
 	anchorFingerprint: AnchorFingerprint | null;
+	checkpoints: DiligentContextCheckpoints;
 };
 
 export type ToolCallBlock = {
@@ -82,6 +101,14 @@ type DiligentContextRuntimeStore = {
 	snapshot: DiligentContextRuntimeSnapshot | null;
 };
 
+type ProvenanceBuckets = {
+	read: Set<string>;
+	written: Set<string>;
+	edited: Set<string>;
+	deleted: Set<string>;
+	moved: Set<string>;
+};
+
 const DILIGENT_CONTEXT_RUNTIME_KEY = Symbol.for("pi.extensions.diligent-context.runtime.v1");
 
 function getDiligentContextRuntimeStore(): DiligentContextRuntimeStore {
@@ -118,10 +145,16 @@ export function setDiligentContextRuntimeSnapshot(
 	store.snapshot = snapshot;
 }
 
+export const EMPTY_CHECKPOINTS: DiligentContextCheckpoints = {
+	provenance: null,
+	contemplation: null,
+};
+
 export const OFF_STATE: DiligentContextState = {
 	enabled: false,
 	anchorMode: null,
 	anchorFingerprint: null,
+	checkpoints: EMPTY_CHECKPOINTS,
 };
 
 export function createContextMessageEntry(entry: SessionEntry): ContextMessageEntry | null {
@@ -248,6 +281,10 @@ export function getString(value: unknown): string | null {
 
 function isAnchorMode(value: unknown): value is AnchorMode {
 	return value === "from-entry" || value === "after-entry" || value === "pending-here";
+}
+
+function isCheckpointKind(value: unknown): value is CheckpointKind {
+	return value === "provenance" || value === "contemplation";
 }
 
 export function truncate(text: string, limit: number = ENTRY_PREVIEW_LIMIT): string {
@@ -600,9 +637,324 @@ function normalizeFingerprint(value: unknown): AnchorFingerprint | null {
 		? toolNamesRaw.map(getString).filter((v): v is string => Boolean(v)).sort()
 		: null;
 	const toolCount = typeof value.toolCount === "number" && Number.isFinite(value.toolCount) ? value.toolCount : 0;
+	const toolResultId = value.toolResultId === null ? null : getString(value.toolResultId);
 	const payloadIndex = typeof value.payloadIndex === "number" && Number.isFinite(value.payloadIndex) ? Math.max(0, Math.floor(value.payloadIndex)) : 0;
 	if (!role) return null;
-	return { role, textPrefix, toolNames, toolCount, payloadIndex };
+	return { role, textPrefix, toolNames, toolCount, toolResultId, payloadIndex };
+}
+
+function createCheckpointId(kind: CheckpointKind): string {
+	return `${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeCheckpoint(kind: CheckpointKind, value: unknown): DiligentCheckpointArtifact | null {
+	if (!isObject(value)) return null;
+	if (value.kind !== kind || !isCheckpointKind(value.kind)) return null;
+	const body = getString(value.body)?.trim();
+	const createdAt = getString(value.createdAt);
+	const id = getString(value.id);
+	if (!body || !createdAt || !id) return null;
+	const checkpoint: DiligentCheckpointArtifact = {
+		id,
+		kind,
+		body,
+		createdAt,
+	};
+	const provider = getString(value.provider);
+	const model = getString(value.model);
+	if (provider) checkpoint.provider = provider;
+	if (model) checkpoint.model = model;
+	if (typeof value.visibleMessageCount === "number" && Number.isFinite(value.visibleMessageCount)) {
+		checkpoint.visibleMessageCount = Math.max(0, Math.floor(value.visibleMessageCount));
+	}
+	return checkpoint;
+}
+
+function normalizeCheckpoints(value: unknown, anchorMode: AnchorMode | null): DiligentContextCheckpoints {
+	if (anchorMode === "pending-here") return EMPTY_CHECKPOINTS;
+	if (!isObject(value)) return EMPTY_CHECKPOINTS;
+	return {
+		provenance: normalizeCheckpoint("provenance", value.provenance),
+		contemplation: normalizeCheckpoint("contemplation", value.contemplation),
+	};
+}
+
+export function cloneContent(content: EventMessage["content"]): EventMessage["content"] {
+	if (!Array.isArray(content)) return content;
+	return content.map((block) => ({ ...block }));
+}
+
+export function cloneEventMessage(message: EventMessage): EventMessage {
+	return {
+		...message,
+		content: cloneContent(message.content),
+	};
+}
+
+export function cloneEventMessages(messages: EventMessage[] | null | undefined): EventMessage[] | null {
+	if (!messages) return null;
+	return messages.map(cloneEventMessage);
+}
+
+export function buildCheckpointArtifact(args: {
+	kind: CheckpointKind;
+	body: string;
+	provider?: string;
+	model?: string;
+	visibleMessageCount?: number;
+	createdAt?: string;
+	id?: string;
+}): DiligentCheckpointArtifact {
+	const body = args.body.trim();
+	if (body.length === 0) {
+		throw new Error(`diligent checkpoint body cannot be empty (${args.kind})`);
+	}
+	const checkpoint: DiligentCheckpointArtifact = {
+		id: args.id ?? createCheckpointId(args.kind),
+		kind: args.kind,
+		body,
+		createdAt: args.createdAt ?? new Date().toISOString(),
+	};
+	if (args.provider) checkpoint.provider = args.provider;
+	if (args.model) checkpoint.model = args.model;
+	if (typeof args.visibleMessageCount === "number" && Number.isFinite(args.visibleMessageCount)) {
+		checkpoint.visibleMessageCount = Math.max(0, Math.floor(args.visibleMessageCount));
+	}
+	return checkpoint;
+}
+
+export function hasActiveCheckpoints(state: DiligentContextState): boolean {
+	return state.checkpoints.contemplation !== null || state.checkpoints.provenance !== null;
+}
+
+export function getActiveCheckpoints(state: DiligentContextState): DiligentCheckpointArtifact[] {
+	const checkpoints: DiligentCheckpointArtifact[] = [];
+	if (state.checkpoints.contemplation) checkpoints.push(state.checkpoints.contemplation);
+	if (state.checkpoints.provenance) checkpoints.push(state.checkpoints.provenance);
+	return checkpoints;
+}
+
+export function withCheckpoint(
+	state: DiligentContextState,
+	checkpoint: DiligentCheckpointArtifact | null,
+): DiligentContextState {
+	if (!checkpoint) return state;
+	return {
+		...state,
+		checkpoints: {
+			...state.checkpoints,
+			[checkpoint.kind]: checkpoint,
+		},
+	};
+}
+
+export function clearCheckpointKinds(
+	state: DiligentContextState,
+	kinds: CheckpointKind[] = ["provenance", "contemplation"],
+): DiligentContextState {
+	const nextCheckpoints: DiligentContextCheckpoints = {
+		...state.checkpoints,
+	};
+	for (const kind of kinds) {
+		nextCheckpoints[kind] = null;
+	}
+	return {
+		...state,
+		checkpoints: nextCheckpoints,
+	};
+}
+
+export function buildAnchoredState(args: {
+	anchorMode: Extract<AnchorMode, "from-entry" | "after-entry">;
+	anchorFingerprint: AnchorFingerprint;
+	checkpoints?: Partial<DiligentContextCheckpoints>;
+}): DiligentContextState {
+	return {
+		enabled: true,
+		anchorMode: args.anchorMode,
+		anchorFingerprint: args.anchorFingerprint,
+		checkpoints: {
+			provenance: args.checkpoints?.provenance ?? null,
+			contemplation: args.checkpoints?.contemplation ?? null,
+		},
+	};
+}
+
+function normalizeToolName(name: string): string {
+	const parts = name.split(".");
+	return parts[parts.length - 1] ?? name;
+}
+
+function normalizePathValue(value: unknown): string | null {
+	const path = getString(value)?.trim();
+	if (!path) return null;
+	return path;
+}
+
+function createProvenanceBuckets(): ProvenanceBuckets {
+	return {
+		read: new Set<string>(),
+		written: new Set<string>(),
+		edited: new Set<string>(),
+		deleted: new Set<string>(),
+		moved: new Set<string>(),
+	};
+}
+
+function collectProvenanceFromMessage(message: EventMessage, buckets: ProvenanceBuckets): void {
+	if (message.role !== "assistant" || !Array.isArray(message.content)) return;
+	for (const block of message.content) {
+		if (!isObject(block) || block.type !== "toolCall") continue;
+		const name = getString(block.name);
+		if (!name) continue;
+		const args = (block as { arguments?: unknown }).arguments;
+		const normalizedName = normalizeToolName(name);
+		if (normalizedName === "read") {
+			const path = normalizePathValue((args as { path?: unknown } | null | undefined)?.path);
+			if (path) buckets.read.add(path);
+			continue;
+		}
+		if (normalizedName === "write") {
+			const path = normalizePathValue((args as { path?: unknown } | null | undefined)?.path);
+			if (path) buckets.written.add(path);
+			continue;
+		}
+		if (normalizedName === "edit") {
+			const path = normalizePathValue((args as { path?: unknown } | null | undefined)?.path);
+			if (path) buckets.edited.add(path);
+			continue;
+		}
+		if (normalizedName === "file_actions") {
+			const fileArgs = isObject(args) ? args : null;
+			const action = getString(fileArgs?.action);
+			const path = normalizePathValue(fileArgs?.path);
+			const newPath = normalizePathValue(fileArgs?.new_path);
+			if (action === "delete" && path) buckets.deleted.add(path);
+			if (action === "move" && path && newPath) buckets.moved.add(`${path} -> ${newPath}`);
+		}
+	}
+}
+
+function formatBucketLines(values: Set<string>): string {
+	return [...values].sort().map((value) => `- ${value}`).join("\n");
+}
+
+function renderProvenanceBody(buckets: ProvenanceBuckets): string {
+	const sections: string[] = [];
+	const readOnly = [...buckets.read].filter((path) => !buckets.written.has(path) && !buckets.edited.has(path) && !buckets.deleted.has(path));
+	if (readOnly.length > 0) {
+		sections.push(`<read>\n${readOnly.sort().map((value) => `- ${value}`).join("\n")}\n</read>`);
+	}
+	if (buckets.edited.size > 0) {
+		sections.push(`<edited>\n${formatBucketLines(buckets.edited)}\n</edited>`);
+	}
+	if (buckets.written.size > 0) {
+		sections.push(`<written>\n${formatBucketLines(buckets.written)}\n</written>`);
+	}
+	if (buckets.deleted.size > 0) {
+		sections.push(`<deleted>\n${formatBucketLines(buckets.deleted)}\n</deleted>`);
+	}
+	if (buckets.moved.size > 0) {
+		sections.push(`<moved>\n${formatBucketLines(buckets.moved)}\n</moved>`);
+	}
+	if (sections.length === 0) return "";
+	return [
+		`<checkpoint v="1" kind="provenance" scope="before-boundary">`,
+		"<files>",
+		...sections,
+		"</files>",
+		"</checkpoint>",
+	].join("\n");
+}
+
+export function buildProvenanceCheckpoint(args: {
+	rawMessages: EventMessage[];
+	resolvedAnchorIndex: number | null;
+	anchorMode: AnchorMode | null;
+}): DiligentCheckpointArtifact | null {
+	if (!args.rawMessages.length) return null;
+	if (args.resolvedAnchorIndex === null) return null;
+	if (args.anchorMode !== "after-entry" && args.anchorMode !== "from-entry") return null;
+	const buckets = createProvenanceBuckets();
+	for (let i = 0; i < args.rawMessages.length; i++) {
+		const beforeBoundary = args.anchorMode === "after-entry" ? i <= args.resolvedAnchorIndex : i < args.resolvedAnchorIndex;
+		if (!beforeBoundary) continue;
+		collectProvenanceFromMessage(args.rawMessages[i], buckets);
+	}
+	const body = renderProvenanceBody(buckets).trim();
+	if (body.length === 0) return null;
+	return buildCheckpointArtifact({ kind: "provenance", body });
+}
+
+export function buildCheckpointDisplayText(checkpoint: DiligentCheckpointArtifact): string {
+	const label = checkpoint.kind === "contemplation"
+		? "[Diligent contemplation checkpoint]"
+		: "[Diligent provenance checkpoint]";
+	return `${label}\n\n${checkpoint.body}`;
+}
+
+export function buildCheckpointSyntheticMessage(checkpoint: DiligentCheckpointArtifact): EventMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: buildCheckpointDisplayText(checkpoint) }],
+	};
+}
+
+export function buildProjectedCheckpointMessages(state: DiligentContextState): EventMessage[] {
+	return getActiveCheckpoints(state).map((checkpoint) => buildCheckpointSyntheticMessage(checkpoint));
+}
+
+export function getDiligentContextStateSignature(state: DiligentContextState): string {
+	return stableJsonStringify(state);
+}
+
+export function computeVisibleSnapshot(args: {
+	rawMessages: EventMessage[];
+	state: DiligentContextState;
+}): {
+	filteredMessages: EventMessage[];
+	keptRawIndices: number[];
+	resolvedAnchorIndex: number | null;
+	changed: boolean;
+	reclaimedTokens: number;
+} {
+	const rawMessages = args.rawMessages;
+	const state = args.state;
+	let filteredMessages = rawMessages;
+	let keptRawIndices = rawMessages.map((_, index) => index);
+	let changed = false;
+	let reclaimedTokens = 0;
+	const resolvedAnchorIndex = state.enabled ? resolveAnchorIndex(rawMessages, state.anchorFingerprint) : null;
+	if (state.enabled && resolvedAnchorIndex !== null) {
+		const pruneResult = applyPruningAtBoundary(rawMessages, resolvedAnchorIndex, state.anchorMode ?? "from-entry");
+		filteredMessages = pruneResult.filteredMessages;
+		keptRawIndices = pruneResult.keptRawIndices;
+		changed = pruneResult.changed;
+		reclaimedTokens = pruneResult.reclaimedTokens;
+	}
+	return {
+		filteredMessages,
+		keptRawIndices,
+		resolvedAnchorIndex,
+		changed,
+		reclaimedTokens,
+	};
+}
+
+export function buildRuntimeSnapshotFromRawMessages(
+	rawMessages: EventMessage[],
+	state: DiligentContextState,
+): DiligentContextRuntimeSnapshot {
+	const projection = computeVisibleSnapshot({ rawMessages, state });
+	const clonedRawMessages = cloneEventMessages(rawMessages) ?? [];
+	const clonedFilteredMessages = cloneEventMessages(projection.filteredMessages) ?? [];
+	return {
+		state,
+		rawMessages: clonedRawMessages,
+		filteredMessages: clonedFilteredMessages,
+		filteredToRawIndices: [...projection.keptRawIndices],
+		resolvedAnchorIndex: projection.resolvedAnchorIndex,
+	};
 }
 
 export function normalizeState(value: unknown): DiligentContextState {
@@ -614,7 +966,12 @@ export function normalizeState(value: unknown): DiligentContextState {
 	if (!isAnchorMode(anchorMode)) return OFF_STATE;
 	const anchorFingerprint = value.anchorFingerprint === null ? null : normalizeFingerprint(value.anchorFingerprint);
 	if (anchorFingerprint === null && anchorMode !== "pending-here") return OFF_STATE;
-	return { enabled: true, anchorMode, anchorFingerprint };
+	return {
+		enabled: true,
+		anchorMode,
+		anchorFingerprint,
+		checkpoints: normalizeCheckpoints(value.checkpoints, anchorMode),
+	};
 }
 
 export function loadStateFromEntries(entries: SessionEntry[] | undefined): DiligentContextState {
@@ -672,6 +1029,7 @@ export function computePayloadFingerprint(msg: EventMessage, payloadIndex: numbe
 		textPrefix,
 		toolNames: toolNames.length > 0 ? [...toolNames].sort() : null,
 		toolCount: toolNames.length,
+		toolResultId: getToolResultId(msg),
 		payloadIndex,
 	};
 }
@@ -679,6 +1037,8 @@ export function computePayloadFingerprint(msg: EventMessage, payloadIndex: numbe
 function fingerprintScore(msg: EventMessage, fingerprint: AnchorFingerprint): number {
 	if ((msg.role ?? "unknown") !== fingerprint.role) return 0;
 	let score = 1;
+	const candidateToolResultId = getToolResultId(msg);
+	if (fingerprint.toolResultId && candidateToolResultId === fingerprint.toolResultId) score += 4;
 	const candidateText = getFingerprintText(msg.content);
 	if (fingerprint.textPrefix && candidateText === fingerprint.textPrefix) score += 3;
 	const candidateNames = getToolCallNames(msg.content);

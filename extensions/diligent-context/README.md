@@ -4,148 +4,76 @@
 
 `/diligent-context` reduces context bloat from stale tool chatter while preserving the human conversation.
 
-The original rolling-window experiment proved the idea worked, but the first anchored redesign used **branch history** as the actionable source of truth. In practice that broke once Pi started sending a transformed live payload (for example with `compactionSummary` and remapped tool IDs).
-
-The current design is therefore **payload-grounded**:
+The design is **payload-grounded**:
 - the picker operates on the **live payload**
-- the reclaim estimates are based on the **live payload**
+- reclaim estimates are based on the **live payload**
 - pruning is applied to the **same live payload**
 
-This restores a 1:1 correlation between:
-- what the user selects
-- what the UI claims is reclaimable
-- what actually gets removed from the outgoing context
+This keeps the UX honest: what the user selects is what the model actually stops seeing.
 
 ---
 
 ## Design goals
 
-1. **Stable cache boundary** — the pruning boundary should remain stationary until the user moves it
-2. **Payload-truthful UX** — the picker should only promise savings that are actually reclaimable from the live payload
-3. **Preserve conversation narrative** — normal user/assistant conversation must remain in context
-4. **Prune only tool baggage** — only historical `toolCall` blocks and matching `toolResult` messages should be removed
-5. **Safe by default** — `/diligent-context` without arguments should inspect/control state, not mutate it implicitly
-6. **Fail safe** — if the selected anchor is no longer present in live payload, prune nothing rather than guessing
+1. **Stable cache boundary** — the pruning boundary remains stationary until the user moves it
+2. **Payload-truthful UX** — reclaim estimates match real prunable payload
+3. **Preserve conversation narrative** — normal user/assistant conversation stays in context
+4. **Prune only tool baggage** — only historical `toolCall` blocks and matching `toolResult` messages are removed
+5. **Checkpoint ownership** — lightweight memory artifacts that survive beyond the boundary belong to `diligent-context`
+6. **Fail safe** — if the anchor can no longer be resolved, prune nothing rather than guessing
 
 ---
 
-## Non-goals
-
-- No rolling `keepLast N` mode
-- No automatic task-boundary inference
-- No pruning of normal conversation history
-- No branch-history reconciliation heuristics for actionable pruning
-
-Branch/session history remains useful for rationale and persistence, but **not** as the actionable pruning universe.
-
----
-
-## Command UX
+## Commands
 
 ### `/diligent-context`
-
-Opens a control menu and shows current state.
-
-It must not change anything by default.
-
-Menu actions:
-
-1. **Set boundary here**
-2. **Pick boundary from live context**
-3. **Turn off**
-4. **Cancel**
+Open the control menu.
 
 ### `/diligent-context here`
+Set the boundary after the current live payload tail.
 
-Sets the boundary **after the current live payload**.
-
-Semantics:
-- all existing live tool calls/results become prunable
-- only future tool calls/results are retained from that point onward
-
-If no cached live payload exists yet (for example right after `/resume`), this command stores a pending intent instead of warning. The footer shows `anchor:pending`, and the anchor materializes automatically on the next real model call once a stable live payload tail exists.
-
-This is the fast path for “start fresh from here.”
-
-### `/diligent-context off`
-
-Disables diligent-context entirely and keeps all tool calls/results in context.
+If there is no live payload yet, the command stores a `pending-here` intent and materializes it on the next real model call.
 
 ### `/diligent-context pick`
+Pick a boundary from the current live payload.
 
-Opens the live-context picker directly.
-
-This is a shortcut for opening `/diligent-context` and choosing **Pick boundary from live context**.
+### `/diligent-context off`
+Disable diligent-context and clear active checkpoints.
 
 ---
 
-## Picker UX
+## Checkpoints
 
-The picker uses the **cached live payload** from the last model call.
+`diligent-context` owns the lightweight artifacts that survive beyond the hidden prefix.
 
-If no live payload has been seen yet, the picker will not open and instead asks the user to send a message first.
+Current checkpoint kinds:
+- `provenance` — deterministic file-touch residue from the hidden prefix
+- `contemplation` — semantic memory checkpoint produced by `/diligent-contemplate`
 
-### First-level picker
+### Visibility model
 
-The first-level list shows:
-- single narrative payload entries directly
-  - user messages
-  - assistant messages with meaningful text
-  - compaction summaries when present in live payload
-- collapsed tool bursts for contiguous tool-heavy assistant activity
+Each active checkpoint has two surfaces:
 
-### Second-level picker
+1. **Chat-visible**
+   - checkpoint creation emits a visible `custom_message`
+   - this gives the human an inspectable transcript artifact
 
-If the user selects a tool burst, open a second-level picker scoped to the exact entries inside that burst.
+2. **Model-visible**
+   - active checkpoints are injected only in the `context` return path
+   - synthetic checkpoint messages never enter the runtime snapshot
+   - compaction and alignment logic therefore stay grounded in real payload only
 
-This preserves exact-entry precision without forcing the user to scan a flat list of low-signal tool rows.
+### Lifecycle rules
 
-### Picker labels and estimates
-
-The picker also displays **live reclaim estimates**:
-- the header dynamically shows the cumulative tokens reclaimed if the highlighted entry is selected
-- individual entries show their reclaimed token value in the description column (rendered in red)
-- tool bursts show their own total token weight within the label
-
-These estimates are derived from the current live payload, not from full branch history.
-
-### Selection semantics
-
-When the user selects a narrative entry in the first-level picker:
-- that selected payload entry is **kept**
-- tool context is retained **from that live entry onward**
-- older live tool calls/results are pruned
-
-When the user selects a tool burst in the first-level picker:
-- open the second-level exact-entry picker for that burst
-- the final exact-entry selection is **kept**
-- tool context is retained **from that exact live entry onward**
-- older live tool calls/results are pruned
+- manual re-anchoring regenerates provenance and clears contemplation
+- `/diligent-context off` clears all checkpoints
+- `pending-here` never coexists with active checkpoints
+- any successful compaction clears active checkpoints
+- persisted diligent state restores checkpoints on branch/session restoration
 
 ---
 
 ## State model
-
-The old rolling state:
-
-```ts
-{
-  enabled: boolean;
-  keepLast: number;
-}
-```
-
-and the later branch-anchored state:
-
-```ts
-{
-  enabled: boolean;
-  anchorEntryId: string | null;
-  anchorMode: "from-entry" | "after-entry" | null;
-}
-```
-
-are replaced with a **payload-grounded anchor state**:
 
 ```ts
 {
@@ -156,26 +84,19 @@ are replaced with a **payload-grounded anchor state**:
     textPrefix: string | null;
     toolNames: string[] | null;
     toolCount: number;
+    toolResultId?: string | null;
     payloadIndex: number;
   } | null;
+  checkpoints: {
+    provenance: DiligentCheckpointArtifact | null;
+    contemplation: DiligentCheckpointArtifact | null;
+  };
 }
 ```
 
-### Meaning
+Persisted diligent state is authoritative.
 
-- `enabled = false` → no pruning
-- `anchorMode = "from-entry"` + `anchorFingerprint` → keep tool context starting at the selected live payload entry
-- `anchorMode = "after-entry"` + `anchorFingerprint` → keep tool context strictly after the selected live payload tail (`/diligent-context here`)
-- `anchorMode = "pending-here"` + `anchorFingerprint = null` → deferred `/diligent-context here`, waiting for the next stable live payload tail to materialize the real anchor
-
-### Why a fingerprint, not branch entry IDs
-
-Live payload messages do not reliably share tool-call IDs with branch history. In production we observed:
-- non-empty prune sets derived from branch history
-- non-empty payload tool IDs
-- **zero overlap** between them
-
-So actionable pruning must resolve against the live payload itself.
+Runtime snapshots are caches only. If cached runtime state diverges from persisted state, diligent-context rebuilds the snapshot from raw payload plus persisted state.
 
 ---
 
@@ -183,67 +104,33 @@ So actionable pruning must resolve against the live payload itself.
 
 The `context` hook shapes what the model sees.
 
-### Invariants
-
-Never prune:
+### Never prune
 - user messages
 - assistant text blocks
-- normal conversational content
-- the latest assistant message if it contains `thinking` or `redacted_thinking` blocks
+- normal conversation history
+- the latest assistant message if it contains `thinking` / `redacted_thinking`
 
-Only prune:
+### Only prune
 - assistant `toolCall` blocks
-- `toolResult` messages linked to those tool calls
+- matching `toolResult` messages
 
-### Core rule
+### Checkpoint invariant
+Synthetic checkpoint messages are projected only at the context boundary.
+They must never pollute:
+- `rawMessages`
+- `filteredMessages`
+- `filteredToRawIndices`
 
-For the current live payload and current anchor:
-- resolve the selected payload boundary using the stored fingerprint
-- collect tool-call IDs from live payload messages **before** that boundary
-- remove those tool calls and matching tool results from the outgoing model context
-
-### Failure handling
-
-If the selected anchor cannot be resolved in the current live payload:
-- fail safe
-- prune nothing
-- log that the anchor is likely already compacted away or otherwise absent from live payload
-
-This applies to both picked anchors and `/diligent-context here` once its remembered tail marker has aged out of live payload.
-
-Over-including context is safer than over-pruning.
-
----
-
-## Anthropic `thinking` block invariant
-
-Anthropic's API requires that the latest assistant message containing `thinking` or `redacted_thinking` blocks remains unmodified.
-
-So the context hook must:
-- preserve that final assistant message exactly
-- preserve its matching `toolResult` messages as well
-
-Otherwise the request becomes invalid and the provider returns a `400 Bad Request`.
-
----
-
-## Payload ID stability diagnostic
-
-The implementation logs a small stability diagnostic between consecutive payloads:
-
-- previous payload tool-ID count
-- current payload tool-ID count
-- stable overlap count
-
-This helps determine whether payload-native IDs remain stable across calls or whether future tightening of fingerprint resolution is needed.
+That invariant keeps `diligent-compact` and turn-end alignment reliable.
 
 ---
 
 ## Extension layout
 
-```
+```text
 extensions/diligent-context/
+├── core.ts     — state model, checkpoint helpers, payload logic
 ├── index.ts    — runtime extension
-├── README.md   — feature spec (this file)
+├── README.md   — feature spec
 └── spec.md     — rationale and decision history
 ```

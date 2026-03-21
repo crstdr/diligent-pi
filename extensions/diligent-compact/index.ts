@@ -12,7 +12,6 @@ import {
 	compact as runNativeCompact,
 	CompactionSummaryMessageComponent,
 	convertToLlm,
-	estimateTokens,
 	getMarkdownTheme,
 	serializeConversation,
 	type CompactionResult,
@@ -22,29 +21,42 @@ import {
 	type SessionBeforeCompactEvent,
 } from "@mariozechner/pi-coding-agent";
 import {
+	buildCheckpointDisplayText,
+	buildContextMessageEntries,
+	buildProjectedCheckpointMessages,
+	buildRuntimeSnapshotFromRawMessages,
+	getActiveCheckpoints,
 	getContextAlignmentComparable,
 	getContextAlignmentMismatchFields,
 	getDiligentContextRuntimeSnapshot,
+	getDiligentContextStateSignature,
 	estimatePayloadTokens,
 	formatTokens,
 	getPayloadNarrativeLabel,
 	getToolCallNames,
-	messagesMatchForContextAlignment,
 	loadStateFromEntries,
+	messagesMatchForContextAlignment,
 	type ContextAlignmentComparable,
 	type ContextAlignmentField,
 	type ContextMessageEntry,
 	type DiligentContextRuntimeSnapshot,
+	type DiligentContextState,
 	type EventMessage,
 	type SessionEntry,
-	buildContextMessageEntries,
 } from "../diligent-context/core.ts";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+import {
+	assertPromptFitsBudget,
+	COMPACTION_TIMEOUT_MS,
+	CONFIG,
+	debugLog,
+	selectOpinionatedModel,
+	startTimedCompactionSignal,
+	type ThinkingLevel,
+} from "./shared.ts";
 
 type CompactionRoute = "native" | "compatibility" | "opinionated" | "force-native";
 type CompactionPreparation = SessionBeforeCompactEvent["preparation"];
@@ -140,40 +152,14 @@ function isVisiblePreparationFailure(
 	return result.ok === false;
 }
 
-const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
-
 const OPINIONATED_REQUEST_TTL_MS = 10_000;
-const COMPACTION_TIMEOUT_MS = 180_000;
 const COMPACTION_STATUS_KEY = "diligent-compact";
 const COMPACTION_SUMMARY_WIDGET_KEY = "diligent-compact-summary";
 
 const pendingCompactionRequests = new Map<string, PendingCompactionRequest>();
 let nextOpinionatedRequestNonce = 1;
 
-type CompactionModelConfig = {
-	provider: string;
-	id: string;
-	/** Optional per-model thinking level override */
-	thinkingLevel?: ThinkingLevel;
-};
-
-type ExtensionConfig = {
-	compactionModels: CompactionModelConfig[];
-	thinkingLevel: ThinkingLevel;
-	debugCompactions: boolean;
-};
-
-const DEFAULT_CONFIG: ExtensionConfig = {
-	compactionModels: [
-		{ provider: "openai-codex", id: "gpt-5.4" },
-		{ provider: "anthropic", id: "claude-opus-4-6" },
-	],
-	thinkingLevel: "high",
-	debugCompactions: false,
-};
-
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(EXTENSION_DIR, "config.json");
 const PROMPT_PATH = path.join(EXTENSION_DIR, "compaction-prompt.md");
 
 const COMPACTIONS_DIR = path.join(homedir(), ".pi", "agent", "extensions", "diligent-compact", "compactions");
@@ -188,49 +174,6 @@ const SUMMARIZATION_SYSTEM_PROMPT =
 const DEFAULT_PROMPT_BODY =
 	"Output ONLY markdown. Keep it concise. Use the exact format requested in the user prompt.";
 
-function normalizeThinkingLevel(value: unknown): ThinkingLevel | undefined {
-	if (typeof value !== "string") return undefined;
-	const lower = value.toLowerCase().trim() as ThinkingLevel;
-	return VALID_THINKING_LEVELS.includes(lower) ? lower : undefined;
-}
-
-function loadConfig(): ExtensionConfig {
-	if (!existsSync(CONFIG_PATH)) {
-		return DEFAULT_CONFIG;
-	}
-
-	try {
-		const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<ExtensionConfig>;
-
-		const compactionModels = Array.isArray(parsed.compactionModels)
-			? parsed.compactionModels
-					.filter((m): m is CompactionModelConfig => Boolean(m) && typeof m.provider === "string" && typeof m.id === "string")
-					.map((m) => ({
-						provider: m.provider,
-						id: m.id,
-						thinkingLevel: normalizeThinkingLevel(m.thinkingLevel),
-					}))
-			: DEFAULT_CONFIG.compactionModels;
-
-		const thinkingLevel = normalizeThinkingLevel(parsed.thinkingLevel) ?? DEFAULT_CONFIG.thinkingLevel;
-
-		const debugCompactions = typeof parsed.debugCompactions === "boolean"
-			? parsed.debugCompactions
-			: DEFAULT_CONFIG.debugCompactions;
-
-		return {
-			compactionModels,
-			thinkingLevel,
-			debugCompactions,
-		};
-	} catch {
-		return DEFAULT_CONFIG;
-	}
-}
-
-// Loaded once at module init (config changes require Pi restart).
-const CONFIG = loadConfig();
-
 function loadPromptBody(): string {
 	try {
 		if (existsSync(PROMPT_PATH)) {
@@ -241,16 +184,6 @@ function loadPromptBody(): string {
 		// fall back
 	}
 	return DEFAULT_PROMPT_BODY;
-}
-
-function debugLog(message: string): void {
-	if (!CONFIG.debugCompactions) return;
-	try {
-		mkdirSync(COMPACTIONS_DIR, { recursive: true });
-		appendFileSync(path.join(COMPACTIONS_DIR, "debug.log"), `[${new Date().toISOString()}] ${message}\n`);
-	} catch {
-		// ignore
-	}
 }
 
 function saveCompactionDebug(sessionId: string, data: unknown): void {
@@ -388,6 +321,27 @@ function isResolvedDiligentSnapshot(snapshot: DiligentContextRuntimeSnapshot | n
 			snapshot.state.anchorMode !== "pending-here" &&
 			snapshot.resolvedAnchorIndex !== null,
 	);
+}
+
+function reconcileSnapshotWithState(
+	sessionId: string,
+	snapshot: DiligentContextRuntimeSnapshot | null,
+	state: DiligentContextState,
+): DiligentContextRuntimeSnapshot | null {
+	if (!snapshot) return null;
+	if (getDiligentContextStateSignature(snapshot.state) === getDiligentContextStateSignature(state)) {
+		return snapshot;
+	}
+	if (!snapshot.rawMessages) return null;
+	const rebuilt = buildRuntimeSnapshotFromRawMessages(snapshot.rawMessages, state);
+	setDiligentContextRuntimeSnapshot(sessionId, rebuilt);
+	return rebuilt;
+}
+
+function buildCheckpointPreviousSummary(state: DiligentContextState): string | undefined {
+	const checkpoints = getActiveCheckpoints(state);
+	if (checkpoints.length === 0) return undefined;
+	return checkpoints.map((checkpoint) => buildCheckpointDisplayText(checkpoint)).join("\n\n");
 }
 
 function getCurrentAnchorSignature(snapshot: DiligentContextRuntimeSnapshot | null): string | null {
@@ -734,6 +688,7 @@ function computeFirstKeptVisibleIndex(messages: EventMessage[], keepRecentTokens
 
 function buildVisiblePreparation(
 	snapshot: DiligentContextRuntimeSnapshot | null,
+	diligentState: DiligentContextState,
 	preparation: CompactionPreparation,
 	branchEntries: SessionBeforeCompactEvent["branchEntries"],
 ): VisiblePreparationBuildResult {
@@ -744,7 +699,7 @@ function buildVisiblePreparation(
 			message: "no live visible context available yet — send a message first",
 		};
 	}
-	if (snapshot.state.enabled && !isResolvedDiligentSnapshot(snapshot)) {
+	if (diligentState.enabled && !isResolvedDiligentSnapshot(snapshot)) {
 		return {
 			ok: false,
 			reason: "anchor-restoring",
@@ -809,6 +764,8 @@ function buildVisiblePreparation(
 	const totalVisibleMessages = snapshot.filteredMessages.length;
 	const summarizedVisibleMessages = messagesToSummarize.length;
 	const keptVisibleMessages = totalVisibleMessages - summarizedVisibleMessages;
+	const projectedCheckpointMessages = buildProjectedCheckpointMessages(diligentState);
+	const previousSummary = buildCheckpointPreviousSummary(diligentState);
 	return {
 		ok: true,
 		preparation: {
@@ -817,8 +774,8 @@ function buildVisiblePreparation(
 			messagesToSummarize,
 			turnPrefixMessages: [],
 			isSplitTurn: false,
-			previousSummary: undefined,
-			tokensBefore: estimatePayloadTokens(snapshot.filteredMessages),
+			previousSummary,
+			tokensBefore: estimatePayloadTokens(snapshot.filteredMessages) + estimatePayloadTokens(projectedCheckpointMessages),
 			fileOps: extractVisibleFileOps(messagesToSummarize) as CompactionPreparation["fileOps"],
 		},
 		anchorSignature: getCurrentAnchorSignature(snapshot),
@@ -889,73 +846,6 @@ function showCompactionSummaryWidget(ctx: ExtensionContext, args: { summary: str
 	);
 }
 
-function startTimedCompactionSignal(parent: AbortSignal, timeoutMs: number): {
-	signal: AbortSignal;
-	cleanup: () => void;
-	didTimeout: () => boolean;
-} {
-	const controller = new AbortController();
-	let timedOut = false;
-	const abortFromParent = (): void => controller.abort();
-	if (parent.aborted) {
-		controller.abort();
-	} else {
-		parent.addEventListener("abort", abortFromParent, { once: true });
-	}
-	const timeoutId = setTimeout(() => {
-		timedOut = true;
-		controller.abort();
-	}, timeoutMs);
-	return {
-		signal: controller.signal,
-		cleanup: () => {
-			clearTimeout(timeoutId);
-			parent.removeEventListener("abort", abortFromParent);
-		},
-		didTimeout: () => timedOut,
-	};
-}
-
-function estimateTextTokens(text: string): number {
-	return Math.ceil(text.length / 4);
-}
-
-function estimatePromptInputTokens(systemPrompt: string, promptText: string, extraOverheadTokens: number = 0): number {
-	const userMessage: UserMessage = {
-		role: "user",
-		content: [{ type: "text", text: promptText }],
-		timestamp: 0,
-	};
-	return estimateTokens(userMessage as never) + estimateTextTokens(systemPrompt) + extraOverheadTokens;
-}
-
-function getSafePromptInputBudget(model: Model<any>, maxTokens?: number): number {
-	const contextWindow = typeof model.contextWindow === "number" && model.contextWindow > 0 ? model.contextWindow : 128000;
-	const outputReserve = typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : 0;
-	const safetyMargin = Math.min(4096, Math.max(1024, Math.floor(contextWindow * 0.03)));
-	return Math.max(0, contextWindow - outputReserve - safetyMargin);
-}
-
-function assertPromptFitsBudget(args: {
-	label: string;
-	model: Model<any>;
-	systemPrompt: string;
-	promptText: string;
-	maxTokens?: number;
-	extraOverheadTokens?: number;
-}): void {
-	const estimatedInputTokens = estimatePromptInputTokens(
-		args.systemPrompt,
-		args.promptText,
-		args.extraOverheadTokens ?? 0,
-	);
-	const safeBudget = getSafePromptInputBudget(args.model, args.maxTokens);
-	if (estimatedInputTokens <= safeBudget) return;
-	throw new Error(
-		`${args.label} prompt too large for ${args.model.provider}/${args.model.id}: estimated input ${formatTokens(estimatedInputTokens)} exceeds safe budget ${formatTokens(safeBudget)}`,
-	);
-}
-
 function buildCompatibilityPromptEstimate(args: {
 	conversationText: string;
 	previousSummary?: string;
@@ -981,39 +871,6 @@ async function getCurrentModelWithApiKey(
 	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
 	if (!apiKey) return null;
 	return { model: ctx.model, apiKey };
-}
-
-async function selectOpinionatedModel(
-	ctx: ExtensionContext,
-	fallbackThinkingLevel: ThinkingLevel,
-): Promise<{ model: Model<any>; apiKey: string; thinkingLevel: ThinkingLevel } | null> {
-	for (const cfg of CONFIG.compactionModels) {
-		const registryModel = ctx.modelRegistry
-			.getAll()
-			.find((model) => model.provider === cfg.provider && model.id === cfg.id);
-		if (!registryModel) {
-			debugLog(`Model ${cfg.provider}/${cfg.id} not registered`);
-			continue;
-		}
-		const apiKey = await ctx.modelRegistry.getApiKey(registryModel);
-		if (!apiKey) {
-			debugLog(`No API key for ${cfg.provider}/${cfg.id}`);
-			continue;
-		}
-		return {
-			model: registryModel,
-			apiKey,
-			thinkingLevel: cfg.thinkingLevel ?? CONFIG.thinkingLevel,
-		};
-	}
-
-	const current = await getCurrentModelWithApiKey(ctx);
-	if (!current) return null;
-	return {
-		model: current.model,
-		apiKey: current.apiKey,
-		thinkingLevel: fallbackThinkingLevel,
-	};
 }
 
 async function runCompatibilityCompaction(args: {
@@ -1325,7 +1182,8 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 		const sessionId = getSessionId(ctx);
 		const pendingRequest = consumePendingCompactionRequest(ctx);
 		const runtimeSnapshot = getDiligentContextRuntimeSnapshot(runtimeSessionId);
-		const diligentState = runtimeSnapshot?.state ?? loadStateFromEntries(branchEntries as SessionEntry[]);
+		const diligentState = loadStateFromEntries(branchEntries as SessionEntry[]);
+		const effectiveSnapshot = reconcileSnapshotWithState(sessionId, runtimeSnapshot, diligentState);
 		const route: CompactionRoute = pendingRequest?.mode === "force-native"
 			? "force-native"
 			: pendingRequest?.mode === "opinionated"
@@ -1343,7 +1201,7 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 			return undefined;
 		}
 
-		const visiblePreparation = buildVisiblePreparation(runtimeSnapshot, preparation, branchEntries);
+		const visiblePreparation = buildVisiblePreparation(effectiveSnapshot, diligentState, preparation, branchEntries);
 		if (route === "force-native") {
 			if (isVisiblePreparationFailure(visiblePreparation)) {
 				const artifactPath = visiblePreparation.reason === "context-mapping-mismatch"
@@ -1353,7 +1211,7 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 						blockedReason: visiblePreparation.reason,
 						blockedMessage: visiblePreparation.message,
 						diagnostic: visiblePreparation.diagnostic,
-						snapshot: runtimeSnapshot,
+						snapshot: effectiveSnapshot,
 						preparation,
 						branchEntries,
 						customInstructions,
@@ -1379,7 +1237,7 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 					blockedReason,
 					blockedMessage,
 					diagnostic: visiblePreparation.diagnostic,
-					snapshot: runtimeSnapshot,
+					snapshot: effectiveSnapshot,
 					preparation,
 					branchEntries,
 					customInstructions,

@@ -12,30 +12,47 @@
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Container, SelectList, Text, type SelectItem } from "@mariozechner/pi-tui";
 import {
-  DILIGENT_CONTEXT_CUSTOM_TYPE as CLEAN_CONTEXT_CUSTOM_TYPE,
-  DILIGENT_CONTEXT_STATUS_KEY as STATUS_KEY,
-  OFF_STATE,
-  applyPruningAtBoundary,
-  buildContextMessageEntries,
-  collectPayloadDiagnostics,
-  computePayloadFingerprint,
-  countToolCalls,
-  estimatePayloadTokens,
-  formatTokens,
-  getPayloadExactLabel,
-  getPayloadNarrativeLabel,
-  getTextBlocks,
-  getToolCallNames,
-  hasThinkingBlock,
-  isToolHeavyMessage,
-  loadStateFromSession,
-  messagesMatchForContextAlignment,
-  resolveAnchorIndex,
-  setDiligentContextRuntimeSnapshot,
-  truncate,
-  type DiligentContextState as CleanContextState,
-  type EventMessage,
-  type SessionEntry,
+	DILIGENT_CHECKPOINT_CUSTOM_TYPE,
+	DILIGENT_CONTEXT_CUSTOM_TYPE as CLEAN_CONTEXT_CUSTOM_TYPE,
+	DILIGENT_CONTEXT_STATUS_KEY as STATUS_KEY,
+	EMPTY_CHECKPOINTS,
+	OFF_STATE,
+	applyPruningAtBoundary,
+	buildAnchoredState,
+	buildCheckpointDisplayText,
+	buildContextMessageEntries,
+	buildProjectedCheckpointMessages,
+	buildProvenanceCheckpoint,
+	buildRuntimeSnapshotFromRawMessages,
+	cloneEventMessages,
+	collectPayloadDiagnostics,
+	computePayloadFingerprint,
+	computeVisibleSnapshot,
+	countToolCalls,
+	estimatePayloadTokens,
+	formatTokens,
+	getActiveCheckpoints,
+	getDiligentContextRuntimeSnapshot,
+	getDiligentContextStateSignature,
+	getPayloadExactLabel,
+	getPayloadNarrativeLabel,
+	getTextBlocks,
+	getToolCallNames,
+	hasActiveCheckpoints,
+	hasThinkingBlock,
+	isToolHeavyMessage,
+	loadStateFromSession,
+	messagesMatchForContextAlignment,
+	resolveAnchorIndex,
+	setDiligentContextRuntimeSnapshot,
+	truncate,
+	type AnchorMode,
+	type DiligentCheckpointArtifact,
+	type DiligentContextCheckpoints,
+	type DiligentContextState as CleanContextState,
+	type DiligentContextRuntimeSnapshot,
+	type EventMessage,
+	type SessionEntry,
 } from "./core.ts";
 
 type DynamicPickerItem = {
@@ -259,10 +276,16 @@ async function showDynamicPicker(
 	});
 }
 
+function checkpointSummary(state: CleanContextState): string {
+	const count = getActiveCheckpoints(state).length;
+	if (count === 0) return "";
+	return count === 1 ? " + 1 checkpoint" : ` + ${count} checkpoints`;
+}
+
 function describeState(state: CleanContextState): string {
 	if (!state.enabled) return "OFF";
 	if (state.anchorMode === "pending-here") return "ON (pending anchor on next message)";
-	return state.anchorMode === "after-entry" ? "ON (starting fresh from here)" : "ON (anchored from live context)";
+	return (state.anchorMode === "after-entry" ? "ON (starting fresh from here)" : "ON (anchored from live context)") + checkpointSummary(state);
 }
 
 function buildTitle(state: CleanContextState): string {
@@ -276,19 +299,20 @@ function updateStatus(ctx: ExtensionContext, state: CleanContextState, messages?
 		return;
 	}
 	const theme = ctx.ui.theme;
+	const checkpointSuffix = hasActiveCheckpoints(state) ? ` cp:${getActiveCheckpoints(state).length}` : "";
 	if (state.anchorMode === "pending-here") {
-		ctx.ui.setStatus(STATUS_KEY, theme.fg("accent", "anchor:pending"));
+		ctx.ui.setStatus(STATUS_KEY, theme.fg("accent", `anchor:pending${checkpointSuffix}`));
 		return;
 	}
 	if (!messages || messages.length === 0) {
-		ctx.ui.setStatus(STATUS_KEY, theme.fg("accent", "anchor:restoring"));
+		ctx.ui.setStatus(STATUS_KEY, theme.fg("accent", `anchor:restoring${checkpointSuffix}`));
 		return;
 	}
 	const resolvedAnchorIndex = resolveAnchorIndex(messages, state.anchorFingerprint);
 	const statusText =
 		resolvedAnchorIndex === null
-			? "anchor:?"
-			: `anchor:${resolvedAnchorIndex + 1}/${messages.length}`;
+			? `anchor:?${checkpointSuffix}`
+			: `anchor:${resolvedAnchorIndex + 1}/${messages.length}${checkpointSuffix}`;
 	ctx.ui.setStatus(STATUS_KEY, theme.fg("accent", statusText));
 }
 
@@ -309,41 +333,121 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 
 	const getSessionId = (ctx: ExtensionContext): string | null => ctx.sessionManager.getSessionId?.() ?? null;
 
-	const reconstruct = (ctx: ExtensionContext): void => {
-		state = loadStateFromSession(ctx);
+	const clearCaches = (): void => {
 		cachedLivePayload = null;
 		cachedRawPayload = null;
 		cachedVisibleToRawIndices = [];
 		previousPayloadIds = null;
+	};
+
+	const applySnapshotToCaches = (snapshot: DiligentContextRuntimeSnapshot | null): void => {
+		if (!snapshot) {
+			clearCaches();
+			return;
+		}
+		state = snapshot.state;
+		cachedRawPayload = cloneEventMessages(snapshot.rawMessages);
+		cachedVisibleToRawIndices = [...snapshot.filteredToRawIndices];
+		cachedLivePayload = cloneEventMessages(snapshot.filteredMessages);
+		previousPayloadIds = cachedLivePayload ? collectPayloadDiagnostics(cachedLivePayload).payloadToolIds : null;
+	};
+
+	const refreshCachedSnapshot = (
+		ctx: ExtensionContext,
+		rawMessagesOverride?: EventMessage[] | null,
+	): DiligentContextRuntimeSnapshot | null => {
+		const nextRawMessages = rawMessagesOverride === undefined ? cachedRawPayload : rawMessagesOverride;
+		if (!nextRawMessages) {
+			clearCaches();
+			setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
+			return null;
+		}
+		const snapshot = buildRuntimeSnapshotFromRawMessages(nextRawMessages, state);
+		setDiligentContextRuntimeSnapshot(getSessionId(ctx), snapshot);
+		applySnapshotToCaches(snapshot);
+		return snapshot;
+	};
+
+	const reconstruct = (ctx: ExtensionContext): void => {
+		state = loadStateFromSession(ctx);
+		clearCaches();
 		setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
 		updateStatus(ctx, state, cachedRawPayload);
 	};
 
-	const refreshCachedSnapshot = (ctx: ExtensionContext): void => {
-		if (!cachedRawPayload) {
-			cachedLivePayload = null;
-			cachedVisibleToRawIndices = [];
-			previousPayloadIds = null;
+	const hydrateCachesFromRuntimeSnapshot = (ctx: ExtensionContext): void => {
+		const snapshot = getDiligentContextRuntimeSnapshot(getSessionId(ctx));
+		if (!snapshot) return;
+		const persistedStateSignature = getDiligentContextStateSignature(state);
+		const snapshotStateSignature = getDiligentContextStateSignature(snapshot.state);
+		if (persistedStateSignature !== snapshotStateSignature) {
+			if (snapshot.rawMessages) {
+				const rebuilt = buildRuntimeSnapshotFromRawMessages(snapshot.rawMessages, state);
+				setDiligentContextRuntimeSnapshot(getSessionId(ctx), rebuilt);
+				applySnapshotToCaches(rebuilt);
+				return;
+			}
 			setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
+			clearCaches();
 			return;
 		}
-		let filteredMessages = cachedRawPayload;
-		let keptRawIndices = cachedRawPayload.map((_, index) => index);
-		const resolvedAnchorIndex = state.enabled ? resolveAnchorIndex(cachedRawPayload, state.anchorFingerprint) : null;
-		if (state.enabled && resolvedAnchorIndex !== null) {
-			const pruneResult = applyPruningAtBoundary(cachedRawPayload, resolvedAnchorIndex, state.anchorMode ?? "from-entry");
-			filteredMessages = pruneResult.filteredMessages;
-			keptRawIndices = pruneResult.keptRawIndices;
-		}
-		cachedVisibleToRawIndices = keptRawIndices;
-		cachedLivePayload = filteredMessages.map((msg) => ({ ...msg }));
-		setDiligentContextRuntimeSnapshot(getSessionId(ctx), {
-			state,
-			rawMessages: cachedRawPayload,
-			filteredMessages: cachedLivePayload,
-			filteredToRawIndices: [...cachedVisibleToRawIndices],
-			resolvedAnchorIndex,
+		applySnapshotToCaches(snapshot);
+	};
+
+	const reconcileCheckpoint = (
+		previousCheckpoint: DiligentCheckpointArtifact | null,
+		nextCheckpoint: DiligentCheckpointArtifact | null,
+	): DiligentCheckpointArtifact | null => {
+		if (!previousCheckpoint || !nextCheckpoint) return nextCheckpoint;
+		return previousCheckpoint.body === nextCheckpoint.body ? previousCheckpoint : nextCheckpoint;
+	};
+
+	const buildAnchorCheckpoints = (args: {
+		rawMessages: EventMessage[];
+		resolvedAnchorIndex: number;
+		anchorMode: Extract<AnchorMode, "from-entry" | "after-entry">;
+		previousState: CleanContextState;
+		contemplation?: DiligentCheckpointArtifact | null;
+	}): DiligentContextCheckpoints => {
+		const nextProvenance = buildProvenanceCheckpoint({
+			rawMessages: args.rawMessages,
+			resolvedAnchorIndex: args.resolvedAnchorIndex,
+			anchorMode: args.anchorMode,
 		});
+		return {
+			provenance: reconcileCheckpoint(args.previousState.checkpoints.provenance, nextProvenance),
+			contemplation: args.contemplation ?? null,
+		};
+	};
+
+	const emitCheckpointMessages = (previousState: CleanContextState, nextState: CleanContextState): void => {
+		for (const checkpoint of getActiveCheckpoints(nextState)) {
+			const previousCheckpoint = previousState.checkpoints[checkpoint.kind];
+			if (previousCheckpoint?.id === checkpoint.id) continue;
+			pi.sendMessage({
+				customType: DILIGENT_CHECKPOINT_CUSTOM_TYPE,
+				content: buildCheckpointDisplayText(checkpoint),
+				display: true,
+				details: {
+					checkpointId: checkpoint.id,
+					kind: checkpoint.kind,
+					active: true,
+				},
+			});
+		}
+	};
+
+	const persist = (
+		ctx: ExtensionContext,
+		previousState: CleanContextState,
+		options?: { emitChangedCheckpoints?: boolean; rawMessagesForRefresh?: EventMessage[] | null },
+	): void => {
+		pi.appendEntry(CLEAN_CONTEXT_CUSTOM_TYPE, state);
+		refreshCachedSnapshot(ctx, options?.rawMessagesForRefresh);
+		updateStatus(ctx, state, cachedRawPayload);
+		if (options?.emitChangedCheckpoints) {
+			emitCheckpointMessages(previousState, state);
+		}
 	};
 
 	const reconcileTurnEndSnapshot = (ctx: ExtensionContext, message: EventMessage): void => {
@@ -383,71 +487,67 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 			console.log("[diligent-context.turn_end] skip: final assistant mismatch");
 			return;
 		}
-		const clonedMessage: EventMessage = {
-			...message,
-			content: Array.isArray(message.content) ? message.content.map((block) => ({ ...block })) : message.content,
-		};
-		cachedRawPayload = [...cachedRawPayload, clonedMessage];
-		refreshCachedSnapshot(ctx);
-		if (cachedLivePayload) {
-			previousPayloadIds = collectPayloadDiagnostics(cachedLivePayload).payloadToolIds;
-		}
-		updateStatus(ctx, state, cachedRawPayload);
-	};
-
-	const persist = (ctx: ExtensionContext): void => {
-		pi.appendEntry(CLEAN_CONTEXT_CUSTOM_TYPE, state);
+		cachedRawPayload = [...cachedRawPayload, message];
 		refreshCachedSnapshot(ctx);
 		updateStatus(ctx, state, cachedRawPayload);
 	};
 
 	const setAnchorHere = (ctx: ExtensionContext): boolean => {
+		const previousState = state;
 		const lastVisibleIndex = cachedLivePayload && cachedLivePayload.length > 0 ? cachedLivePayload.length - 1 : -1;
 		const lastRawIndex = lastVisibleIndex >= 0 ? cachedVisibleToRawIndices[lastVisibleIndex] : undefined;
 		const lastRawMessage =
 			typeof lastRawIndex === "number" && cachedRawPayload && cachedRawPayload[lastRawIndex]
 				? cachedRawPayload[lastRawIndex]
 				: null;
-		if (!lastRawMessage || !cachedLivePayload) {
+		if (!lastRawMessage || !cachedRawPayload) {
 			state = {
 				enabled: true,
 				anchorMode: "pending-here",
 				anchorFingerprint: null,
+				checkpoints: EMPTY_CHECKPOINTS,
 			};
-			persist(ctx);
+			persist(ctx, previousState, { emitChangedCheckpoints: true });
 			return true;
 		}
-		state = {
-			enabled: true,
+		state = buildAnchoredState({
 			anchorMode: "after-entry",
 			anchorFingerprint: computePayloadFingerprint(lastRawMessage, lastRawIndex),
-		};
-		persist(ctx);
+			checkpoints: buildAnchorCheckpoints({
+				rawMessages: cachedRawPayload,
+				resolvedAnchorIndex: lastRawIndex,
+				anchorMode: "after-entry",
+				previousState,
+			}),
+		});
+		persist(ctx, previousState, { emitChangedCheckpoints: true });
 		return true;
 	};
 
 	const setAnchorFromPayloadIndex = (ctx: ExtensionContext, payloadIndex: number): void => {
+		const previousState = state;
 		const rawIndex = cachedVisibleToRawIndices[payloadIndex];
 		if (!cachedLivePayload || !cachedLivePayload[payloadIndex] || typeof rawIndex !== "number" || !cachedRawPayload || !cachedRawPayload[rawIndex]) {
 			notify(ctx, "diligent-context: selected live context entry is no longer available", "warning");
 			return;
 		}
-		state = {
-			enabled: true,
+		state = buildAnchoredState({
 			anchorMode: "from-entry",
 			anchorFingerprint: computePayloadFingerprint(cachedRawPayload[rawIndex], rawIndex),
-		};
-		persist(ctx);
+			checkpoints: buildAnchorCheckpoints({
+				rawMessages: cachedRawPayload,
+				resolvedAnchorIndex: rawIndex,
+				anchorMode: "from-entry",
+				previousState,
+			}),
+		});
+		persist(ctx, previousState, { emitChangedCheckpoints: true });
 	};
 
 	const turnOff = (ctx: ExtensionContext): void => {
+		const previousState = state;
 		state = OFF_STATE;
-		cachedLivePayload = null;
-		cachedRawPayload = null;
-		cachedVisibleToRawIndices = [];
-		previousPayloadIds = null;
-		setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
-		persist(ctx);
+		persist(ctx, previousState);
 	};
 
 	const pickBoundaryFromHistory = async (ctx: ExtensionContext): Promise<boolean> => {
@@ -547,6 +647,9 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 	};
 
 	const showMenu = async (ctx: ExtensionContext): Promise<void> => {
+		state = loadStateFromSession(ctx);
+		hydrateCachesFromRuntimeSnapshot(ctx);
+		updateStatus(ctx, state, cachedRawPayload);
 		if (!ctx.hasUI) {
 			notify(ctx, `diligent-context: ${describeState(state)}. Usage: /diligent-context [here|off|pick]`, "info");
 			return;
@@ -608,17 +711,28 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_switch", async (_event, ctx) => {
-		cachedLivePayload = null;
-		cachedRawPayload = null;
-		cachedVisibleToRawIndices = [];
-		previousPayloadIds = null;
+		clearCaches();
 		setDiligentContextRuntimeSnapshot(getSessionId(ctx), null);
 		if (ctx.hasUI) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 		}
 	});
 
+	pi.on("session_compact", async (_event, ctx) => {
+		const latestState = loadStateFromSession(ctx);
+		if (hasActiveCheckpoints(latestState)) {
+			state = {
+				...latestState,
+				checkpoints: EMPTY_CHECKPOINTS,
+			};
+			pi.appendEntry(CLEAN_CONTEXT_CUSTOM_TYPE, state);
+		}
+		reconstruct(ctx);
+	});
+
 	pi.on("turn_end", async (event, ctx) => {
+		state = loadStateFromSession(ctx);
+		hydrateCachesFromRuntimeSnapshot(ctx);
 		reconcileTurnEndSnapshot(ctx, event.message as EventMessage);
 	});
 
@@ -626,6 +740,9 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 		description:
 			"Open Diligent Context settings (payload-grounded pruning for old tool calls/results). Usage: /diligent-context [here|off|pick]",
 		handler: async (args, ctx) => {
+			state = loadStateFromSession(ctx);
+			hydrateCachesFromRuntimeSnapshot(ctx);
+			updateStatus(ctx, state, cachedRawPayload);
 			const trimmed = String(args ?? "").trim();
 			if (!trimmed) {
 				await showMenu(ctx);
@@ -657,6 +774,7 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("context", async (event, ctx) => {
+		state = loadStateFromSession(ctx);
 		const rawMessages = event.messages as EventMessage[];
 		if (state.enabled && state.anchorMode === "pending-here") {
 			let materializeIndex = -1;
@@ -668,52 +786,42 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 			}
 			const materializeMessage = materializeIndex >= 0 ? rawMessages[materializeIndex] : null;
 			if (materializeMessage) {
-				state = {
-					enabled: true,
+				const previousState = state;
+				state = buildAnchoredState({
 					anchorMode: "after-entry",
 					anchorFingerprint: computePayloadFingerprint(materializeMessage, materializeIndex),
-				};
-				persist(ctx);
+					checkpoints: buildAnchorCheckpoints({
+						rawMessages,
+						resolvedAnchorIndex: materializeIndex,
+						anchorMode: "after-entry",
+						previousState,
+					}),
+				});
+				persist(ctx, previousState, { emitChangedCheckpoints: true, rawMessagesForRefresh: rawMessages });
 				console.log(`[diligent-context] pending-here resolved to after-entry at index ${materializeIndex}`);
 			} else {
 				console.log("[diligent-context] pending-here: no stable live payload narrative entry yet, staying pending");
 			}
 		}
-		let filteredMessages = rawMessages;
-		let keptRawIndices = rawMessages.map((_, index) => index);
-		let changed = false;
-		let actualReclaimedTokens = 0;
-		const resolvedAnchorIndex = state.enabled ? resolveAnchorIndex(rawMessages, state.anchorFingerprint) : null;
 
+		const projection = computeVisibleSnapshot({ rawMessages, state });
 		if (state.enabled) {
-			if (resolvedAnchorIndex === null) {
+			if (projection.resolvedAnchorIndex === null) {
 				if (state.anchorMode !== "pending-here") {
 					console.log("[diligent-context] anchor not found in live payload — skipping pruning (likely compacted away)");
 				}
 			} else {
-				const pruneResult = applyPruningAtBoundary(rawMessages, resolvedAnchorIndex, state.anchorMode ?? "from-entry");
-				filteredMessages = pruneResult.filteredMessages;
-				keptRawIndices = pruneResult.keptRawIndices;
-				changed = pruneResult.changed;
-				actualReclaimedTokens = pruneResult.reclaimedTokens;
 				console.log(
-					`[diligent-context.debug] mode=${state.anchorMode ?? "null"} resolvedAnchor=${resolvedAnchorIndex} payloadPruneIds=${pruneResult.payloadPruneIds.size} protected=${pruneResult.protectedIds.size} before≈${estimatePayloadTokens(rawMessages)} after≈${estimatePayloadTokens(filteredMessages)} reclaimed≈${actualReclaimedTokens} changed=${changed}`,
+					`[diligent-context.debug] mode=${state.anchorMode ?? "null"} resolvedAnchor=${projection.resolvedAnchorIndex} before≈${estimatePayloadTokens(rawMessages)} after≈${estimatePayloadTokens(projection.filteredMessages)} reclaimed≈${projection.reclaimedTokens} changed=${projection.changed}`,
 				);
 			}
 		}
 
-		cachedRawPayload = rawMessages.map((msg) => ({ ...msg }));
-		cachedVisibleToRawIndices = keptRawIndices;
-		cachedLivePayload = filteredMessages.map((msg) => ({ ...msg }));
-		setDiligentContextRuntimeSnapshot(getSessionId(ctx), {
-			state,
-			rawMessages: cachedRawPayload,
-			filteredMessages: cachedLivePayload,
-			filteredToRawIndices: [...cachedVisibleToRawIndices],
-			resolvedAnchorIndex,
-		});
+		const snapshot = buildRuntimeSnapshotFromRawMessages(rawMessages, state);
+		setDiligentContextRuntimeSnapshot(getSessionId(ctx), snapshot);
+		applySnapshotToCaches(snapshot);
 		updateStatus(ctx, state, cachedRawPayload);
-		const currentDiagnostics = collectPayloadDiagnostics(cachedLivePayload);
+		const currentDiagnostics = collectPayloadDiagnostics(cachedLivePayload ?? []);
 		if (previousPayloadIds) {
 			let stable = 0;
 			for (const id of previousPayloadIds) {
@@ -725,6 +833,17 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 		}
 		previousPayloadIds = currentDiagnostics.payloadToolIds;
 
-		return changed ? { messages: filteredMessages } : undefined;
+		const shouldProjectCheckpoints =
+			state.enabled &&
+			state.anchorMode !== "pending-here" &&
+			projection.resolvedAnchorIndex !== null &&
+			hasActiveCheckpoints(state);
+		if (!projection.changed && !shouldProjectCheckpoints) {
+			return undefined;
+		}
+		const projectedMessages = shouldProjectCheckpoints
+			? [...buildProjectedCheckpointMessages(state), ...(snapshot.filteredMessages ?? [])]
+			: (snapshot.filteredMessages ?? []);
+		return { messages: projectedMessages };
 	});
 }

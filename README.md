@@ -1,14 +1,14 @@
 # diligent-pi
 
-A small collection of Pi extensions focused on **careful context shaping** rather than maximal automation.
+A small collection of Pi extensions focused on **careful context shaping** and **extension-owned memory checkpoints** rather than maximal automation.
 
-This repo is the **canonical source of truth** for the diligent extensions.
-Downstream consumers should vendor from here rather than evolving their own divergent copies.
+This repo is the canonical source of truth for the diligent extensions.
 
 Current extensions:
 
-- **diligent-context** — hide stale tool chatter from the live payload while preserving the human conversation
-- **diligent-compact** — keep compaction aligned with the context that remains visible under `diligent-context`, with diagnostics and an explicit `/diligent-compact` command
+- **diligent-context** — hide stale tool chatter from the live payload while preserving the human conversation, and own boundary-surviving checkpoints
+- **diligent-compact** — keep compaction aligned with the context that remains visible under `diligent-context`, consuming active checkpoints as carry-forward input
+- **diligent-contemplate** — generate semantic contemplation checkpoints without relying on Pi-core assistant-message persistence
 
 ## Install
 
@@ -24,11 +24,20 @@ Example:
 ```bash
 cp -R extensions/diligent-context ~/.pi/agent/extensions/
 cp -R extensions/diligent-compact ~/.pi/agent/extensions/
+cp -R extensions/diligent-contemplate ~/.pi/agent/extensions/
 ```
 
 ## Important
 
-`diligent-compact` depends on the shared `diligent-context/core.ts` helpers, so for now you should install **both folders together**.
+Dependency notes:
+
+- `diligent-compact` depends on shared helpers from `diligent-context/core.ts`
+- `diligent-contemplate` depends on both `diligent-context` and `diligent-compact/shared.ts`
+
+So for now:
+
+- install `diligent-context` + `diligent-compact` together
+- install all three folders together if you want `diligent-contemplate`
 
 ## Commands
 
@@ -45,20 +54,17 @@ cp -R extensions/diligent-compact ~/.pi/agent/extensions/
 - `/diligent-compact [instructions]`
 - `/diligent-compact --force-native [instructions]`
 
-## Downstream workflow
+### diligent-contemplate
 
-Downstream consumers can sync from the local committed `diligent-pi` `HEAD`.
+- `/diligent-contemplate [custom prompt]`
 
-Recommended local workflow:
+## Architecture
 
-1. work in this repo
-2. commit in `diligent-pi`
-3. sync the committed state into your downstream consumer or extension install
-4. test before pushing upstream
-
-This intentionally syncs **committed local changes only**.
-Uncommitted work is excluded so downstream testing stays reproducible.
+- `diligent-context` owns the pruning boundary, persisted checkpoints, restoration, and checkpoint projection rules
+- `diligent-compact` performs visibility-aware compaction over the same live visible universe the model sees
+- `diligent-contemplate` produces semantic contemplation checkpoints that `diligent-context` persists and projects
+- no extension depends on a Pi-core assistant-message persistence API
 
 ## Notes
 
-This is a personal repo shared for practical use. The extensions are stable enough to use, but the structure may still evolve.
+These extensions are stable enough to use, but the structure may still evolve as the architecture is refined.
