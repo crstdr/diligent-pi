@@ -70,7 +70,7 @@ Include, when relevant:
 - Environment: ports, deployments, tables/assets, and env vars/services actually referenced
 - Tools: MCP/CLI/skills actively used (include brief usage notes only if non-obvious)
 - Collaborators & process: whether this is human-in-the-loop vs full-auto, what approvals are pending/required, and RepoPrompt window/tab binding if relevant
-- Canonical docs to update: based on /docs/_canonical_index.md, list any existing canonical docs that should be brought up to date (decisions/architecture only, not project status). Do NOT create new canonical docs.
+- Canonical docs to update: list any existing repo docs/specs that should be brought up to date (decisions/architecture only, not project status). Do NOT create new canonical docs.
 - Anything else critical: if important continuation context doesn't fit elsewhere, include it here (keep it minimal)
 
 ### 8. Next Steps
