@@ -69,7 +69,7 @@ Include, when relevant:
 - Mandatory reading: exact repo-relative file paths to reopen next session (specs, key code, docs)
 - Environment: ports, deployments, tables/assets, and env vars/services actually referenced
 - Tools: MCP/CLI/skills actively used (include brief usage notes only if non-obvious)
-- Collaborators & process: whether this is human-in-the-loop vs full-auto, what approvals are pending/required, and RepoPrompt window/tab binding if relevant
+- Operational context: any approvals, tool/session state, or continuation constraints that materially affect the next session
 - Canonical docs to update: list any existing repo docs/specs that should be brought up to date (decisions/architecture only, not project status). Do NOT create new canonical docs.
 - Anything else critical: if important continuation context doesn't fit elsewhere, include it here (keep it minimal)
 
