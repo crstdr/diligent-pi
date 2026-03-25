@@ -7,9 +7,7 @@
  * - opinionated: run our custom model/prompt compactor on the diligent-visible slice
  */
 
-import { completeSimple, type Model, type UserMessage } from "@mariozechner/pi-ai";
 import {
-	compact as runNativeCompact,
 	CompactionSummaryMessageComponent,
 	convertToLlm,
 	getMarkdownTheme,
@@ -30,10 +28,10 @@ import {
 	getContextAlignmentMismatchFields,
 	getDiligentContextRuntimeSnapshot,
 	getDiligentContextStateSignature,
+	setDiligentContextRuntimeSnapshot,
 	estimatePayloadTokens,
 	formatTokens,
 	getPayloadNarrativeLabel,
-	getToolCallNames,
 	loadStateFromEntries,
 	messagesMatchForContextAlignment,
 	type ContextAlignmentComparable,
@@ -44,17 +42,17 @@ import {
 	type EventMessage,
 	type SessionEntry,
 } from "../diligent-context/core.ts";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-	assertPromptFitsBudget,
-	COMPACTION_TIMEOUT_MS,
+	buildTaggedPromptText,
 	CONFIG,
 	debugLog,
-	selectOpinionatedModel,
-	startTimedCompactionSignal,
+	readOptionalTextFile,
+	runCompatibilityCompactionRequest,
+	runOpinionatedCompactionRequest,
 	type ThinkingLevel,
 } from "./shared.ts";
 
@@ -174,18 +172,6 @@ const SUMMARIZATION_SYSTEM_PROMPT =
 const DEFAULT_PROMPT_BODY =
 	"Output ONLY markdown. Keep it concise. Use the exact format requested in the user prompt.";
 
-function loadPromptBody(): string {
-	try {
-		if (existsSync(PROMPT_PATH)) {
-			const text = readFileSync(PROMPT_PATH, "utf8").trim();
-			if (text.length > 0) return text;
-		}
-	} catch {
-		// fall back
-	}
-	return DEFAULT_PROMPT_BODY;
-}
-
 function saveCompactionDebug(sessionId: string, data: unknown): void {
 	if (!CONFIG.debugCompactions) return;
 	try {
@@ -196,37 +182,6 @@ function saveCompactionDebug(sessionId: string, data: unknown): void {
 	} catch {
 		// ignore
 	}
-}
-
-function buildPromptText(args: {
-	previousSummary?: string;
-	conversationText: string;
-	splitTurnPrefixText?: string;
-	customInstructions?: string;
-	promptBody: string;
-}): string {
-	const blocks: string[] = [];
-
-	const prev = (args.previousSummary ?? "").trim();
-	if (prev.length > 0) {
-		blocks.push(`<previous_compaction_summary>\n${prev}\n</previous_compaction_summary>`);
-	}
-
-	blocks.push(`<conversation>\n${args.conversationText.trim()}\n</conversation>`);
-
-	const splitPrefix = (args.splitTurnPrefixText ?? "").trim();
-	if (splitPrefix.length > 0) {
-		blocks.push(`<split_turn_prefix>\n${splitPrefix}\n</split_turn_prefix>`);
-	}
-
-	const ci = (args.customInstructions ?? "").trim();
-	if (ci.length > 0) {
-		blocks.push(`<custom_instructions>\n${ci}\n</custom_instructions>`);
-	}
-
-	blocks.push(args.promptBody.trim());
-
-	return blocks.join("\n\n").trim();
 }
 
 function getRuntimeSessionId(ctx: ExtensionContext): string | null {
@@ -851,243 +806,32 @@ function buildCompatibilityPromptEstimate(args: {
 	previousSummary?: string;
 	customInstructions?: string;
 }): string {
-	let promptText = `<conversation>\n${args.conversationText}\n</conversation>\n\n`;
-	const previousSummary = (args.previousSummary ?? "").trim();
-	if (previousSummary.length > 0) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += "Create a structured context checkpoint summary that another LLM will use to continue the work.";
-	const customInstructions = (args.customInstructions ?? "").trim();
-	if (customInstructions.length > 0) {
-		promptText += `\n\nAdditional focus: ${customInstructions}`;
-	}
-	return promptText;
-}
-
-async function getCurrentModelWithApiKey(
-	ctx: ExtensionContext,
-): Promise<{ model: Model<any>; apiKey: string } | null> {
-	if (!ctx.model) return null;
-	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
-	if (!apiKey) return null;
-	return { model: ctx.model, apiKey };
-}
-
-async function runCompatibilityCompaction(args: {
-	ctx: ExtensionContext;
-	preparation: CompactionPreparation;
-	customInstructions?: string;
-	signal: AbortSignal;
-	sessionId: string;
-}): Promise<CompactionResult> {
-	const modelWithKey = await getCurrentModelWithApiKey(args.ctx);
-	if (!modelWithKey) {
-		throw new Error("No current model/API key available for compatibility compaction");
-	}
-	const reserveTokens = args.preparation.settings?.reserveTokens;
-	const historyMaxTokens = (typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0)
-		? Math.floor(0.8 * reserveTokens)
-		: undefined;
-	if (args.preparation.messagesToSummarize.length > 0) {
-		const historyPromptText = buildCompatibilityPromptEstimate({
-			conversationText: serializeConversation(convertToLlm(args.preparation.messagesToSummarize)),
-			previousSummary: typeof args.preparation.previousSummary === "string" ? args.preparation.previousSummary : undefined,
-			customInstructions: args.customInstructions,
-		});
-		assertPromptFitsBudget({
-			label: "compatibility compaction",
-			model: modelWithKey.model,
-			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-			promptText: historyPromptText,
-			maxTokens: historyMaxTokens,
-			extraOverheadTokens: 1536,
-		});
-	}
-	if (args.preparation.isSplitTurn && args.preparation.turnPrefixMessages.length > 0) {
-		const splitPromptText = `<conversation>\n${serializeConversation(convertToLlm(args.preparation.turnPrefixMessages))}\n</conversation>\n\nSummarize only the retained turn prefix context.`;
-		assertPromptFitsBudget({
-			label: "compatibility split-turn compaction",
-			model: modelWithKey.model,
-			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-			promptText: splitPromptText,
-			maxTokens: typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0
-				? Math.floor(0.5 * reserveTokens)
+	return buildTaggedPromptText([
+		{ tag: "conversation", text: args.conversationText },
+		{ tag: "previous-summary", text: args.previousSummary },
+		{ text: "Create a structured context checkpoint summary that another LLM will use to continue the work." },
+		{
+			text: args.customInstructions?.trim()
+				? `Additional focus: ${args.customInstructions.trim()}`
 				: undefined,
-			extraOverheadTokens: 1024,
-		});
-	}
-	debugLog(
-		`route=compatibility provider=${modelWithKey.model.provider} model=${modelWithKey.model.id} delta=${args.preparation.messagesToSummarize.length} prefix=${args.preparation.turnPrefixMessages.length}`,
-	);
-	const timed = startTimedCompactionSignal(args.signal, COMPACTION_TIMEOUT_MS);
-	try {
-		const result = await runNativeCompact(
-			args.preparation,
-			modelWithKey.model,
-			modelWithKey.apiKey,
-			args.customInstructions,
-			timed.signal,
-		);
-		if (timed.didTimeout()) {
-			throw new Error(`compatibility compaction timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
-		}
-		if (CONFIG.debugCompactions) {
-			saveCompactionDebug(args.sessionId, {
-				kind: "compatibility_success",
-				provider: modelWithKey.model.provider,
-				model: modelWithKey.model.id,
-				messagesToSummarizeCount: args.preparation.messagesToSummarize.length,
-				turnPrefixMessagesCount: args.preparation.turnPrefixMessages.length,
-				usedPreviousSummary: Boolean(args.preparation.previousSummary),
-				customInstructionsPresent: Boolean(args.customInstructions),
-				outputSummaryChars: result.summary.length,
-			});
-		}
-		return result;
-	} catch (error) {
-		if (timed.didTimeout()) {
-			throw new Error(`compatibility compaction timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
-		}
-		throw error;
-	} finally {
-		timed.cleanup();
-	}
+		},
+	]);
 }
 
-async function runOpinionatedCompaction(args: {
-	ctx: ExtensionContext;
-	preparation: CompactionPreparation;
+function buildOpinionatedPromptText(args: {
+	previousSummary?: string;
+	conversationText: string;
+	splitTurnPrefixText?: string;
 	customInstructions?: string;
-	signal: AbortSignal;
-	sessionId: string;
-	fallbackThinkingLevel: ThinkingLevel;
-}): Promise<CompactionResult> {
-	const selected = await selectOpinionatedModel(args.ctx, args.fallbackThinkingLevel);
-	if (!selected) {
-		throw new Error("No model/API key available for opinionated compaction");
-	}
-
-	const previousSummary = typeof args.preparation.previousSummary === "string"
-		? args.preparation.previousSummary
-		: undefined;
-	const isSplitTurn = Boolean(args.preparation.isSplitTurn);
-	const conversationText = serializeConversation(convertToLlm(args.preparation.messagesToSummarize));
-	const splitTurnPrefixText = (isSplitTurn && args.preparation.turnPrefixMessages.length > 0)
-		? serializeConversation(convertToLlm(args.preparation.turnPrefixMessages))
-		: undefined;
-	const promptBody = loadPromptBody();
-	const promptText = buildPromptText({
-		previousSummary,
-		conversationText,
-		splitTurnPrefixText,
-		customInstructions: args.customInstructions,
-		promptBody,
-	});
-
-	const reserveTokens = args.preparation.settings?.reserveTokens;
-	const maxTokens = (typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0)
-		? Math.floor(0.8 * reserveTokens)
-		: undefined;
-	assertPromptFitsBudget({
-		label: "diligent-compact",
-		model: selected.model,
-		systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-		promptText,
-		maxTokens,
-		extraOverheadTokens: 512,
-	});
-
-	notify(
-		args.ctx,
-		`diligent-compact: compacting ${args.preparation.messagesToSummarize.length} visible messages with ${selected.model.provider}/${selected.model.id} (thinking: ${selected.thinkingLevel})`,
-		"info",
-	);
-
-	const userMessage: UserMessage = {
-		role: "user",
-		content: [{ type: "text", text: promptText }],
-		timestamp: Date.now(),
-	};
-
-	const completeOptions: {
-		apiKey: string;
-		signal: AbortSignal;
-		reasoning?: ThinkingLevel;
-		maxTokens?: number;
-	} = {
-		apiKey: selected.apiKey,
-		signal: args.signal,
-	};
-	if (selected.thinkingLevel !== "off") {
-		completeOptions.reasoning = selected.thinkingLevel;
-	}
-	if (typeof maxTokens === "number") {
-		completeOptions.maxTokens = maxTokens;
-	}
-
-	const timed = startTimedCompactionSignal(args.signal, COMPACTION_TIMEOUT_MS);
-	try {
-		const response = await completeSimple(
-			selected.model,
-			{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: [userMessage] },
-			{ ...completeOptions, signal: timed.signal },
-		);
-		if (timed.didTimeout()) {
-			throw new Error(`diligent-compact timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
-		}
-		if (response.stopReason === "aborted" || args.signal.aborted) {
-			throw new Error("Compaction cancelled");
-		}
-		if (response.stopReason === "error") {
-			throw new Error(response.errorMessage ?? "Opinionated compaction failed");
-		}
-
-		const summary = response.content
-			.filter((content): content is { type: "text"; text: string } => content.type === "text")
-			.map((content) => content.text)
-			.join("\n")
-			.trim();
-		if (!summary) {
-			throw new Error("Opinionated compaction returned empty summary");
-		}
-
-		saveCompactionDebug(args.sessionId, {
-			kind: "opinionated_success",
-			provider: selected.model.provider,
-			model: selected.model.id,
-			thinkingLevel: selected.thinkingLevel,
-			maxTokens,
-			firstKeptEntryId: args.preparation.firstKeptEntryId,
-			tokensBefore: args.preparation.tokensBefore,
-			previousSummaryChars: previousSummary?.length ?? 0,
-			conversationChars: conversationText.length,
-			splitTurnPrefixChars: splitTurnPrefixText?.length ?? 0,
-			customInstructionsPresent: Boolean(args.customInstructions),
-			usage: response.usage,
-			outputSummaryChars: summary.length,
-		});
-
-		return {
-			summary,
-			firstKeptEntryId: args.preparation.firstKeptEntryId,
-			tokensBefore: args.preparation.tokensBefore,
-			details: {
-				provider: selected.model.provider,
-				modelId: selected.model.id,
-				thinkingLevel: selected.thinkingLevel,
-				deltaMessages: args.preparation.messagesToSummarize.length,
-				splitTurnPrefixMessages: args.preparation.turnPrefixMessages.length,
-				usedPreviousSummary: Boolean(previousSummary && previousSummary.trim().length > 0),
-			},
-		};
-	} catch (error) {
-		if (timed.didTimeout()) {
-			throw new Error(`diligent-compact timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
-		}
-		throw error;
-	} finally {
-		timed.cleanup();
-	}
+	promptBody: string;
+}): string {
+	return buildTaggedPromptText([
+		{ tag: "previous_compaction_summary", text: args.previousSummary },
+		{ tag: "conversation", text: args.conversationText },
+		{ tag: "split_turn_prefix", text: args.splitTurnPrefixText },
+		{ tag: "custom_instructions", text: args.customInstructions },
+		{ text: args.promptBody },
+	]);
 }
 
 export default function diligentCompactExtension(pi: ExtensionAPI) {
@@ -1264,20 +1008,41 @@ export default function diligentCompactExtension(pi: ExtensionAPI) {
 
 		try {
 			const result = route === "opinionated"
-				? await runOpinionatedCompaction({
+				? await runOpinionatedCompactionRequest({
 					ctx,
 					preparation: visibleCompactionPreparation,
+					promptText: buildOpinionatedPromptText({
+						previousSummary: typeof visibleCompactionPreparation.previousSummary === "string"
+							? visibleCompactionPreparation.previousSummary
+							: undefined,
+						conversationText: serializeConversation(convertToLlm(visibleCompactionPreparation.messagesToSummarize)),
+						splitTurnPrefixText: visibleCompactionPreparation.isSplitTurn && visibleCompactionPreparation.turnPrefixMessages.length > 0
+							? serializeConversation(convertToLlm(visibleCompactionPreparation.turnPrefixMessages))
+							: undefined,
+						customInstructions,
+						promptBody: readOptionalTextFile(PROMPT_PATH, DEFAULT_PROMPT_BODY),
+					}),
+					systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
 					customInstructions,
 					signal,
-					sessionId,
 					fallbackThinkingLevel: pendingRequest?.fallbackThinkingLevel ?? CONFIG.thinkingLevel,
+					notify: (text, level = "info") => notify(ctx, text, level),
+					onDebug: CONFIG.debugCompactions ? (payload) => saveCompactionDebug(sessionId, payload) : undefined,
 				})
-				: await runCompatibilityCompaction({
+				: await runCompatibilityCompactionRequest({
 					ctx,
 					preparation: visibleCompactionPreparation,
 					customInstructions,
 					signal,
-					sessionId,
+					systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+					promptEstimateText: buildCompatibilityPromptEstimate({
+						conversationText: serializeConversation(convertToLlm(visibleCompactionPreparation.messagesToSummarize)),
+						previousSummary: typeof visibleCompactionPreparation.previousSummary === "string"
+							? visibleCompactionPreparation.previousSummary
+							: undefined,
+						customInstructions,
+					}),
+					onDebug: CONFIG.debugCompactions ? (payload) => saveCompactionDebug(sessionId, payload) : undefined,
 				});
 
 			return { compaction: attachDiligentDetails(result, route, anchorSignature) };

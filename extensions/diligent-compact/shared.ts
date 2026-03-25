@@ -1,11 +1,20 @@
-import type { Model, UserMessage } from "@mariozechner/pi-ai";
-import { estimateTokens, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { completeSimple, type Model, type UserMessage } from "@mariozechner/pi-ai";
+import {
+	compact as runNativeCompact,
+	convertToLlm,
+	estimateTokens,
+	serializeConversation,
+	type CompactionResult,
+	type ExtensionContext,
+	type SessionBeforeCompactEvent,
+} from "@mariozechner/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type NotifyLevel = "info" | "warning" | "error";
 
 export type CompactionModelConfig = {
 	provider: string;
@@ -17,6 +26,13 @@ export type ExtensionConfig = {
 	compactionModels: CompactionModelConfig[];
 	thinkingLevel: ThinkingLevel;
 	debugCompactions: boolean;
+};
+
+export type CompactionPreparation = SessionBeforeCompactEvent["preparation"];
+
+type CurrentModelWithApiKey = {
+	model: Model<any>;
+	apiKey: string;
 };
 
 const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
@@ -36,7 +52,7 @@ const COMPACTIONS_DIR = path.join(homedir(), ".pi", "agent", "extensions", "dili
 
 export const COMPACTION_TIMEOUT_MS = 180_000;
 
-function formatTokens(tokens: number): string {
+export function formatTokens(tokens: number): string {
 	if (tokens < 1000) return `~${tokens} tokens`;
 	return `~${(tokens / 1000).toFixed(1)}k tokens`;
 }
@@ -90,6 +106,35 @@ export function debugLog(message: string): void {
 	} catch {
 		// ignore
 	}
+}
+
+export function readOptionalTextFile(filePath: string, fallback: string): string {
+	try {
+		if (existsSync(filePath)) {
+			const text = readFileSync(filePath, "utf8").trim();
+			if (text.length > 0) return text;
+		}
+	} catch {
+		// fall back
+	}
+	return fallback;
+}
+
+export function buildTaggedPromptText(
+	blocks: Array<{
+		tag?: string;
+		text?: string | null;
+	}>,
+): string {
+	return blocks
+		.map((block) => {
+			const text = block.text?.trim();
+			if (!text) return null;
+			return block.tag ? `<${block.tag}>\n${text}\n</${block.tag}>` : text;
+		})
+		.filter((block): block is string => typeof block === "string" && block.length > 0)
+		.join("\n\n")
+		.trim();
 }
 
 export function startTimedCompactionSignal(parent: AbortSignal, timeoutMs: number): {
@@ -159,9 +204,9 @@ export function assertPromptFitsBudget(args: {
 	);
 }
 
-async function getCurrentModelWithApiKey(
+export async function getCurrentModelWithApiKey(
 	ctx: ExtensionContext,
-): Promise<{ model: Model<any>; apiKey: string } | null> {
+): Promise<CurrentModelWithApiKey | null> {
 	if (!ctx.model) return null;
 	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
 	if (!apiKey) return null;
@@ -199,4 +244,217 @@ export async function selectOpinionatedModel(
 		apiKey: current.apiKey,
 		thinkingLevel: fallbackThinkingLevel,
 	};
+}
+
+export async function runCompatibilityCompactionRequest(args: {
+	ctx: ExtensionContext;
+	preparation: CompactionPreparation;
+	customInstructions?: string;
+	signal: AbortSignal;
+	systemPrompt: string;
+	promptEstimateText: string;
+	onDebug?: (payload: unknown) => void;
+}): Promise<CompactionResult> {
+	const modelWithKey = await getCurrentModelWithApiKey(args.ctx);
+	if (!modelWithKey) {
+		throw new Error("No current model/API key available for compatibility compaction");
+	}
+
+	const reserveTokens = args.preparation.settings?.reserveTokens;
+	const historyMaxTokens = (typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0)
+		? Math.floor(0.8 * reserveTokens)
+		: undefined;
+	if (args.preparation.messagesToSummarize.length > 0) {
+		assertPromptFitsBudget({
+			label: "compatibility compaction",
+			model: modelWithKey.model,
+			systemPrompt: args.systemPrompt,
+			promptText: args.promptEstimateText,
+			maxTokens: historyMaxTokens,
+			extraOverheadTokens: 1536,
+		});
+	}
+	if (args.preparation.isSplitTurn && args.preparation.turnPrefixMessages.length > 0) {
+		const splitPromptText = buildTaggedPromptText([
+			{
+				tag: "conversation",
+				text: serializeConversation(convertToLlm(args.preparation.turnPrefixMessages)),
+			},
+			{ text: "Summarize only the retained turn prefix context." },
+		]);
+		assertPromptFitsBudget({
+			label: "compatibility split-turn compaction",
+			model: modelWithKey.model,
+			systemPrompt: args.systemPrompt,
+			promptText: splitPromptText,
+			maxTokens: typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0
+				? Math.floor(0.5 * reserveTokens)
+				: undefined,
+			extraOverheadTokens: 1024,
+		});
+	}
+
+	debugLog(
+		`route=compatibility provider=${modelWithKey.model.provider} model=${modelWithKey.model.id} delta=${args.preparation.messagesToSummarize.length} prefix=${args.preparation.turnPrefixMessages.length}`,
+	);
+
+	const timed = startTimedCompactionSignal(args.signal, COMPACTION_TIMEOUT_MS);
+	try {
+		const result = await runNativeCompact(
+			args.preparation,
+			modelWithKey.model,
+			modelWithKey.apiKey,
+			args.customInstructions,
+			timed.signal,
+		);
+		if (timed.didTimeout()) {
+			throw new Error(`compatibility compaction timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
+		}
+		args.onDebug?.({
+			kind: "compatibility_success",
+			provider: modelWithKey.model.provider,
+			model: modelWithKey.model.id,
+			messagesToSummarizeCount: args.preparation.messagesToSummarize.length,
+			turnPrefixMessagesCount: args.preparation.turnPrefixMessages.length,
+			usedPreviousSummary: Boolean(args.preparation.previousSummary),
+			customInstructionsPresent: Boolean(args.customInstructions),
+			outputSummaryChars: result.summary.length,
+		});
+		return result;
+	} catch (error) {
+		if (timed.didTimeout()) {
+			throw new Error(`compatibility compaction timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
+		}
+		throw error;
+	} finally {
+		timed.cleanup();
+	}
+}
+
+export async function runOpinionatedCompactionRequest(args: {
+	ctx: ExtensionContext;
+	preparation: CompactionPreparation;
+	promptText: string;
+	systemPrompt: string;
+	customInstructions?: string;
+	signal: AbortSignal;
+	fallbackThinkingLevel: ThinkingLevel;
+	notify?: (text: string, level?: NotifyLevel) => void;
+	onDebug?: (payload: unknown) => void;
+}): Promise<CompactionResult> {
+	const selected = await selectOpinionatedModel(args.ctx, args.fallbackThinkingLevel);
+	if (!selected) {
+		throw new Error("No model/API key available for opinionated compaction");
+	}
+
+	const reserveTokens = args.preparation.settings?.reserveTokens;
+	const maxTokens = (typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens > 0)
+		? Math.floor(0.8 * reserveTokens)
+		: undefined;
+	assertPromptFitsBudget({
+		label: "diligent-compact",
+		model: selected.model,
+		systemPrompt: args.systemPrompt,
+		promptText: args.promptText,
+		maxTokens,
+		extraOverheadTokens: 512,
+	});
+
+	args.notify?.(
+		`diligent-compact: compacting ${args.preparation.messagesToSummarize.length} visible messages with ${selected.model.provider}/${selected.model.id} (thinking: ${selected.thinkingLevel})`,
+		"info",
+	);
+
+	const userMessage: UserMessage = {
+		role: "user",
+		content: [{ type: "text", text: args.promptText }],
+		timestamp: Date.now(),
+	};
+
+	const completeOptions: {
+		apiKey: string;
+		signal: AbortSignal;
+		reasoning?: ThinkingLevel;
+		maxTokens?: number;
+	} = {
+		apiKey: selected.apiKey,
+		signal: args.signal,
+	};
+	if (selected.thinkingLevel !== "off") {
+		completeOptions.reasoning = selected.thinkingLevel;
+	}
+	if (typeof maxTokens === "number") {
+		completeOptions.maxTokens = maxTokens;
+	}
+
+	const timed = startTimedCompactionSignal(args.signal, COMPACTION_TIMEOUT_MS);
+	try {
+		const response = await completeSimple(
+			selected.model,
+			{ systemPrompt: args.systemPrompt, messages: [userMessage] },
+			{ ...completeOptions, signal: timed.signal },
+		);
+		if (timed.didTimeout()) {
+			throw new Error(`diligent-compact timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
+		}
+		if (response.stopReason === "aborted" || args.signal.aborted) {
+			throw new Error("Compaction cancelled");
+		}
+		if (response.stopReason === "error") {
+			throw new Error(response.errorMessage ?? "Opinionated compaction failed");
+		}
+
+		const summary = response.content
+			.filter((content): content is { type: "text"; text: string } => content.type === "text")
+			.map((content) => content.text)
+			.join("\n")
+			.trim();
+		if (!summary) {
+			throw new Error("Opinionated compaction returned empty summary");
+		}
+
+		const conversationText = serializeConversation(convertToLlm(args.preparation.messagesToSummarize));
+		const splitTurnPrefixText = (args.preparation.isSplitTurn && args.preparation.turnPrefixMessages.length > 0)
+			? serializeConversation(convertToLlm(args.preparation.turnPrefixMessages))
+			: undefined;
+		const previousSummary = typeof args.preparation.previousSummary === "string"
+			? args.preparation.previousSummary
+			: undefined;
+		args.onDebug?.({
+			kind: "opinionated_success",
+			provider: selected.model.provider,
+			model: selected.model.id,
+			thinkingLevel: selected.thinkingLevel,
+			maxTokens,
+			firstKeptEntryId: args.preparation.firstKeptEntryId,
+			tokensBefore: args.preparation.tokensBefore,
+			previousSummaryChars: previousSummary?.length ?? 0,
+			conversationChars: conversationText.length,
+			splitTurnPrefixChars: splitTurnPrefixText?.length ?? 0,
+			customInstructionsPresent: Boolean(args.customInstructions),
+			usage: response.usage,
+			outputSummaryChars: summary.length,
+		});
+
+		return {
+			summary,
+			firstKeptEntryId: args.preparation.firstKeptEntryId,
+			tokensBefore: args.preparation.tokensBefore,
+			details: {
+				provider: selected.model.provider,
+				modelId: selected.model.id,
+				thinkingLevel: selected.thinkingLevel,
+				deltaMessages: args.preparation.messagesToSummarize.length,
+				splitTurnPrefixMessages: args.preparation.turnPrefixMessages.length,
+				usedPreviousSummary: Boolean(previousSummary && previousSummary.trim().length > 0),
+			},
+		};
+	} catch (error) {
+		if (timed.didTimeout()) {
+			throw new Error(`diligent-compact timed out after ${Math.round(COMPACTION_TIMEOUT_MS / 1000)}s`);
+		}
+		throw error;
+	} finally {
+		timed.cleanup();
+	}
 }
