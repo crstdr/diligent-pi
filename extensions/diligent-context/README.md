@@ -47,7 +47,7 @@ Disable diligent-context and clear active checkpoints.
 `diligent-context` owns the lightweight artifacts that survive beyond the hidden prefix.
 
 Current checkpoint kinds:
-- `provenance` — deterministic file-touch residue from the hidden prefix
+- `provenance` — deterministic, success-aware file-touch residue from recognized hidden-prefix tool activity
 - `contemplation` — semantic memory checkpoint produced by `/diligent-contemplate`
 
 ### Visibility model

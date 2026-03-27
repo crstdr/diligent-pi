@@ -22,9 +22,10 @@ Putting them in `diligent-context` keeps these decisions in one place:
 ## Checkpoint kinds
 
 ### Provenance checkpoint
-- deterministic
-- derived from file-touching tool activity in the hidden prefix
+- deterministic within its recognized tool surfaces
+- success-aware: derived from recognized file-touching tool activity plus successful tool results in the hidden prefix
 - compact and factual
+- conservative by design: unsupported commands are omitted rather than guessed
 - no LLM involvement
 
 ### Contemplation checkpoint
