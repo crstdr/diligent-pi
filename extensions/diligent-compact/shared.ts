@@ -35,6 +35,16 @@ type CurrentModelWithApiKey = {
 	apiKey: string;
 };
 
+type ModelRegistryLike = {
+	getApiKey?: (model: Model<any>) => Promise<string | undefined> | string | undefined;
+	getApiKeyForProvider?: (provider: string) => Promise<string | undefined> | string | undefined;
+	getAll?: () => Model<any>[];
+	getAvailable?: () => Promise<Model<any>[]> | Model<any>[];
+	authStorage?: {
+		getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	};
+};
+
 const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 const DEFAULT_CONFIG: ExtensionConfig = {
@@ -204,11 +214,40 @@ export function assertPromptFitsBudget(args: {
 	);
 }
 
+async function resolveApiKeyForModel(
+	registry: ModelRegistryLike | undefined,
+	model: Model<any>,
+): Promise<string | undefined> {
+	if (!registry) return undefined;
+	if (typeof registry.getApiKey === "function") {
+		return await registry.getApiKey(model);
+	}
+	if (typeof registry.getApiKeyForProvider === "function") {
+		return await registry.getApiKeyForProvider(model.provider);
+	}
+	if (typeof registry.authStorage?.getApiKey === "function") {
+		return await registry.authStorage.getApiKey(model.provider);
+	}
+	return undefined;
+}
+
+async function getRegisteredModels(registry: ModelRegistryLike | undefined): Promise<Model<any>[]> {
+	if (!registry) return [];
+	if (typeof registry.getAll === "function") {
+		return registry.getAll();
+	}
+	if (typeof registry.getAvailable === "function") {
+		const models = await registry.getAvailable();
+		return Array.isArray(models) ? models : [];
+	}
+	return [];
+}
+
 export async function getCurrentModelWithApiKey(
 	ctx: ExtensionContext,
 ): Promise<CurrentModelWithApiKey | null> {
 	if (!ctx.model) return null;
-	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+	const apiKey = await resolveApiKeyForModel(ctx.modelRegistry as ModelRegistryLike | undefined, ctx.model);
 	if (!apiKey) return null;
 	return { model: ctx.model, apiKey };
 }
@@ -217,15 +256,15 @@ export async function selectOpinionatedModel(
 	ctx: ExtensionContext,
 	fallbackThinkingLevel: ThinkingLevel,
 ): Promise<{ model: Model<any>; apiKey: string; thinkingLevel: ThinkingLevel } | null> {
+	const registry = ctx.modelRegistry as ModelRegistryLike | undefined;
+	const registeredModels = await getRegisteredModels(registry);
 	for (const cfg of CONFIG.compactionModels) {
-		const registryModel = ctx.modelRegistry
-			.getAll()
-			.find((model) => model.provider === cfg.provider && model.id === cfg.id);
+		const registryModel = registeredModels.find((model) => model.provider === cfg.provider && model.id === cfg.id);
 		if (!registryModel) {
 			debugLog(`Model ${cfg.provider}/${cfg.id} not registered`);
 			continue;
 		}
-		const apiKey = await ctx.modelRegistry.getApiKey(registryModel);
+		const apiKey = await resolveApiKeyForModel(registry, registryModel);
 		if (!apiKey) {
 			debugLog(`No API key for ${cfg.provider}/${cfg.id}`);
 			continue;
