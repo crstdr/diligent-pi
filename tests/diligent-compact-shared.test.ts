@@ -65,4 +65,29 @@ describe("diligent-compact/shared model registry compatibility", () => {
 		expect(result?.model.provider).toBe("openai-codex");
 		expect(result?.apiKey).toBe("provider-key");
 	});
+
+	test("selectOpinionatedModel falls back to current model when configured models are unavailable", async () => {
+		const currentModel = { provider: "anthropic", id: "runtime-current" } as any;
+		const result = await shared.selectOpinionatedModel(
+			{
+				model: currentModel,
+				modelRegistry: {
+					getAvailable: async () => [],
+					getApiKeyForProvider: async (provider: string) => provider === "anthropic" ? "current-key" : undefined,
+				},
+			} as any,
+			"medium",
+		);
+
+		expect(result).not.toBeNull();
+		expect(result?.model.provider).toBe("anthropic");
+		expect(result?.model.id).toBe("runtime-current");
+		expect(result?.apiKey).toBe("current-key");
+		expect(result?.thinkingLevel).toBe("medium");
+	});
+
+	test("selectOpinionatedModel returns null instead of throwing for partial empty registries", async () => {
+		await expect(shared.selectOpinionatedModel({ model: fallbackModel, modelRegistry: {} } as any, "low")).resolves.toBeNull();
+		await expect(shared.getCurrentModelWithApiKey({ model: fallbackModel, modelRegistry: {} } as any)).resolves.toBeNull();
+	});
 });
