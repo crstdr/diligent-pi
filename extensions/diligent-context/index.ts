@@ -466,25 +466,19 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 				if (contextEntry.sourceType === "custom_message") {
 					continue;
 				}
-				console.log(`[diligent-context.turn_end] skip: prefix mismatch at ${rawIndex}`);
 				return;
 			}
 			remainingEntries.push(contextEntry);
 		}
 		if (rawIndex !== cachedRawPayload.length) {
-			console.log(`[diligent-context.turn_end] skip: matched=${rawIndex} cached=${cachedRawPayload.length}`);
 			return;
 		}
 		const remainingRequired = remainingEntries.filter((entry) => entry.sourceType !== "custom_message");
 		if (remainingRequired.length !== 1) {
-			console.log(
-				`[diligent-context.turn_end] skip: remainingRequired=${remainingRequired.length} remainingTotal=${remainingEntries.length}`,
-			);
 			return;
 		}
 		const [finalRequired] = remainingRequired;
 		if (finalRequired.message.role !== "assistant" || !messagesMatchForContextAlignment(finalRequired.message, message)) {
-			console.log("[diligent-context.turn_end] skip: final assistant mismatch");
 			return;
 		}
 		cachedRawPayload = [...cachedRawPayload, message];
