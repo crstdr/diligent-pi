@@ -7,10 +7,18 @@ mock.module("@mariozechner/pi-ai", () => ({
 }));
 
 mock.module("@mariozechner/pi-coding-agent", () => ({
+	DynamicBorder: class DynamicBorder {
+		constructor(_render: unknown) {}
+	},
+	CompactionSummaryMessageComponent: class CompactionSummaryMessageComponent {
+		constructor(..._args: unknown[]) {}
+		setExpanded(_value: boolean) {}
+	},
 	compact: async () => {
 		throw new Error("not used in these tests");
 	},
 	convertToLlm: (value: unknown) => value,
+	getMarkdownTheme: () => ({}),
 	serializeConversation: () => "",
 	estimateTokens(value: unknown) {
 		return Math.ceil(JSON.stringify(value).length / 4);

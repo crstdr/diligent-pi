@@ -1601,8 +1601,14 @@ function getFingerprintText(content: string | ContentBlock[] | undefined): strin
 	return getThinkingBlocks(content)[0] ?? null;
 }
 
+function getMessageFingerprintText(msg: EventMessage): string | null {
+	const summary = getString((msg as { summary?: unknown }).summary);
+	if (summary) return truncate(summary, FINGERPRINT_TEXT_LIMIT);
+	return getFingerprintText(msg.content);
+}
+
 export function computePayloadFingerprint(msg: EventMessage, payloadIndex: number): AnchorFingerprint {
-	const textPrefix = getFingerprintText(msg.content);
+	const textPrefix = getMessageFingerprintText(msg);
 	const toolNames = getToolCallNames(msg.content);
 	return {
 		role: msg.role ?? "unknown",
@@ -1619,7 +1625,7 @@ function fingerprintScore(msg: EventMessage, fingerprint: AnchorFingerprint): nu
 	let score = 1;
 	const candidateToolResultId = getToolResultId(msg);
 	if (fingerprint.toolResultId && candidateToolResultId === fingerprint.toolResultId) score += 4;
-	const candidateText = getFingerprintText(msg.content);
+	const candidateText = getMessageFingerprintText(msg);
 	if (fingerprint.textPrefix && candidateText === fingerprint.textPrefix) score += 3;
 	const candidateNames = getToolCallNames(msg.content);
 	const sortedCandidateNames = candidateNames.length > 0 ? [...candidateNames].sort() : null;

@@ -640,6 +640,51 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	const findLastNarrativePayloadIndex = (rawMessages: EventMessage[]): number | null => {
+		for (let i = rawMessages.length - 1; i >= 0; i--) {
+			if (getPayloadNarrativeLabel(rawMessages[i]) !== null) return i;
+		}
+		return null;
+	};
+
+	const materializePendingHereBoundary = (
+		ctx: ExtensionContext,
+		rawMessages: EventMessage[],
+		checkpointSeedState: CleanContextState,
+	): boolean => {
+		const materializeIndex = findLastNarrativePayloadIndex(rawMessages);
+		if (materializeIndex === null) return false;
+		const previousState = state;
+		state = buildAnchoredState({
+			anchorMode: "after-entry",
+			anchorFingerprint: computePayloadFingerprint(rawMessages[materializeIndex], materializeIndex),
+			checkpoints: buildAnchorCheckpoints({
+				rawMessages,
+				resolvedAnchorIndex: materializeIndex,
+				anchorMode: "after-entry",
+				previousState: checkpointSeedState,
+			}),
+		});
+		persist(ctx, previousState, { emitChangedCheckpoints: true, rawMessagesForRefresh: rawMessages });
+		return true;
+	};
+
+	const recoverLostAnchorBoundary = (ctx: ExtensionContext, rawMessages: EventMessage[]): void => {
+		const previousState = state;
+		const resetState: CleanContextState = {
+			enabled: true,
+			anchorMode: "pending-here",
+			anchorFingerprint: null,
+			checkpoints: EMPTY_CHECKPOINTS,
+		};
+		state = resetState;
+		if (materializePendingHereBoundary(ctx, rawMessages, resetState)) {
+			return;
+		}
+		state = resetState;
+		persist(ctx, previousState, { emitChangedCheckpoints: true, rawMessagesForRefresh: rawMessages });
+	};
+
 	const showMenu = async (ctx: ExtensionContext): Promise<void> => {
 		state = loadStateFromSession(ctx);
 		hydrateCachesFromRuntimeSnapshot(ctx);
@@ -771,38 +816,23 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 		state = loadStateFromSession(ctx);
 		const rawMessages = event.messages as EventMessage[];
 		if (state.enabled && state.anchorMode === "pending-here") {
-			let materializeIndex = -1;
-			for (let i = rawMessages.length - 1; i >= 0; i--) {
-				if (getPayloadNarrativeLabel(rawMessages[i]) !== null) {
-					materializeIndex = i;
-					break;
-				}
-			}
-			const materializeMessage = materializeIndex >= 0 ? rawMessages[materializeIndex] : null;
-			if (materializeMessage) {
-				const previousState = state;
-				state = buildAnchoredState({
-					anchorMode: "after-entry",
-					anchorFingerprint: computePayloadFingerprint(materializeMessage, materializeIndex),
-					checkpoints: buildAnchorCheckpoints({
-						rawMessages,
-						resolvedAnchorIndex: materializeIndex,
-						anchorMode: "after-entry",
-						previousState,
-					}),
-				});
-				persist(ctx, previousState, { emitChangedCheckpoints: true, rawMessagesForRefresh: rawMessages });
-				console.log(`[diligent-context] pending-here resolved to after-entry at index ${materializeIndex}`);
+			if (materializePendingHereBoundary(ctx, rawMessages, state)) {
+				const materializeIndex = findLastNarrativePayloadIndex(rawMessages);
+				console.log(`[diligent-context] pending-here resolved to after-entry at index ${materializeIndex ?? -1}`);
 			} else {
 				console.log("[diligent-context] pending-here: no stable live payload narrative entry yet, staying pending");
 			}
 		}
 
-		const projection = computeVisibleSnapshot({ rawMessages, state });
+		let projection = computeVisibleSnapshot({ rawMessages, state });
+		if (state.enabled && state.anchorMode !== "pending-here" && projection.resolvedAnchorIndex === null) {
+			recoverLostAnchorBoundary(ctx, rawMessages);
+			projection = computeVisibleSnapshot({ rawMessages, state });
+		}
 		if (state.enabled) {
 			if (projection.resolvedAnchorIndex === null) {
 				if (state.anchorMode !== "pending-here") {
-					console.log("[diligent-context] anchor not found in live payload — skipping pruning (likely compacted away)");
+					console.log("[diligent-context] anchor not found in live payload — leaving context unpruned for this turn");
 				}
 			} else {
 				console.log(

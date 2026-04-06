@@ -226,7 +226,14 @@ export default function diligentContemplateExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (initialSnapshot.state.enabled && initialSnapshot.state.anchorMode !== "pending-here" && initialSnapshot.resolvedAnchorIndex === null) {
-				notify(ctx, "diligent-contemplate blocked: the current diligent-context boundary is still restoring", "warning");
+				const anchorLost = (initialSnapshot.rawMessages?.length ?? 0) > 0;
+				notify(
+					ctx,
+					anchorLost
+						? "diligent-contemplate blocked: the current diligent-context anchor was lost from live payload — send another message or run /diligent-context here to re-anchor"
+						: "diligent-contemplate blocked: the current diligent-context boundary is still restoring",
+					"warning",
+				);
 				return;
 			}
 			if (initialSnapshot.state.checkpoints.contemplation && !hasMessagesBeyondAnchor(initialSnapshot)) {

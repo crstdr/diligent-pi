@@ -655,10 +655,13 @@ function buildVisiblePreparation(
 		};
 	}
 	if (diligentState.enabled && !isResolvedDiligentSnapshot(snapshot)) {
+		const anchorLost = snapshot.state.anchorMode !== "pending-here" && (snapshot.rawMessages?.length ?? 0) > 0;
 		return {
 			ok: false,
 			reason: "anchor-restoring",
-			message: "the current diligent-context boundary is still restoring — send a message first",
+			message: anchorLost
+				? "the current diligent-context anchor was lost from live payload — send another message or run /diligent-context here to re-anchor"
+				: "the current diligent-context boundary is still restoring — send a message first",
 		};
 	}
 	if (!snapshot.rawMessages || snapshot.filteredToRawIndices.length !== snapshot.filteredMessages.length) {
