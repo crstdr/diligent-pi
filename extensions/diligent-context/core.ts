@@ -1488,16 +1488,18 @@ export function getDiligentContextStateSignature(state: DiligentContextState): s
 	return stableJsonStringify(state);
 }
 
-export function computeVisibleSnapshot(args: {
-	rawMessages: EventMessage[];
-	state: DiligentContextState;
-}): {
+export type DiligentContextVisibleSnapshot = {
 	filteredMessages: EventMessage[];
 	keptRawIndices: number[];
 	resolvedAnchorIndex: number | null;
 	changed: boolean;
 	reclaimedTokens: number;
-} {
+};
+
+export function computeVisibleSnapshot(args: {
+	rawMessages: EventMessage[];
+	state: DiligentContextState;
+}): DiligentContextVisibleSnapshot {
 	const rawMessages = args.rawMessages;
 	const state = args.state;
 	let filteredMessages = rawMessages;
@@ -1521,11 +1523,12 @@ export function computeVisibleSnapshot(args: {
 	};
 }
 
-export function buildRuntimeSnapshotFromRawMessages(
-	rawMessages: EventMessage[],
-	state: DiligentContextState,
-): DiligentContextRuntimeSnapshot {
-	const projection = computeVisibleSnapshot({ rawMessages, state });
+export function buildRuntimeSnapshotFromProjection(args: {
+	rawMessages: EventMessage[];
+	state: DiligentContextState;
+	projection: DiligentContextVisibleSnapshot;
+}): DiligentContextRuntimeSnapshot {
+	const { rawMessages, state, projection } = args;
 	const clonedRawMessages = cloneEventMessages(rawMessages) ?? [];
 	const clonedFilteredMessages = cloneEventMessages(projection.filteredMessages) ?? [];
 	return {
@@ -1535,6 +1538,14 @@ export function buildRuntimeSnapshotFromRawMessages(
 		filteredToRawIndices: [...projection.keptRawIndices],
 		resolvedAnchorIndex: projection.resolvedAnchorIndex,
 	};
+}
+
+export function buildRuntimeSnapshotFromRawMessages(
+	rawMessages: EventMessage[],
+	state: DiligentContextState,
+): DiligentContextRuntimeSnapshot {
+	const projection = computeVisibleSnapshot({ rawMessages, state });
+	return buildRuntimeSnapshotFromProjection({ rawMessages, state, projection });
 }
 
 export function normalizeState(value: unknown): DiligentContextState {

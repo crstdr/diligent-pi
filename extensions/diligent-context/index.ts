@@ -23,6 +23,7 @@ import {
 	buildContextMessageEntries,
 	buildProjectedCheckpointMessages,
 	buildProvenanceCheckpoint,
+	buildRuntimeSnapshotFromProjection,
 	buildRuntimeSnapshotFromRawMessages,
 	cloneEventMessages,
 	collectPayloadDiagnostics,
@@ -841,7 +842,7 @@ export default function diligentContextExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		const snapshot = buildRuntimeSnapshotFromRawMessages(rawMessages, state);
+		const snapshot = buildRuntimeSnapshotFromProjection({ rawMessages, state, projection });
 		setDiligentContextRuntimeSnapshot(getSessionId(ctx), snapshot);
 		applySnapshotToCaches(snapshot);
 		updateStatus(ctx, state, cachedRawPayload);

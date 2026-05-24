@@ -188,6 +188,47 @@ describe("diligent-context lost-anchor recovery", () => {
 		expect(snapshot?.resolvedAnchorIndex).toBe(1);
 	});
 
+	test("lost-anchor recovery snapshot uses the recomputed post-recovery projection", async () => {
+		const harness = createHarness();
+		diligentContextExtension(harness.pi as any);
+
+		const rawMessages: EventMessage[] = [
+			assistantToolCall({ id: "old-read", name: "read_file", arguments: { path: "hidden.ts" } }),
+			toolResult("old-read", "hidden tool result"),
+			userText("Please continue from the current visible work."),
+			assistantText("Working on it."),
+		];
+		harness.branchEntries.push(
+			...rawMessages.map((message, index) => messageEntry(`msg-${index + 1}`, message)),
+			{
+				id: "state-1",
+				type: "custom",
+				customType: core.DILIGENT_CONTEXT_CUSTOM_TYPE,
+				data: core.buildAnchoredState({
+					anchorMode: "after-entry",
+					anchorFingerprint: core.computePayloadFingerprint(assistantText("old missing anchor"), 0),
+				}),
+			},
+		);
+
+		const contextHandler = harness.handlers.get("context")?.[0];
+		expect(contextHandler).toBeDefined();
+		const result = await contextHandler?.({ messages: rawMessages }, harness.ctx);
+
+		const latestState = core.loadStateFromEntries(harness.branchEntries as SessionEntry[]);
+		expect(latestState.enabled).toBe(true);
+		expect(latestState.anchorMode).toBe("after-entry");
+
+		const snapshot = core.getDiligentContextRuntimeSnapshot("session-1");
+		expect(snapshot).not.toBeNull();
+		expect(snapshot?.resolvedAnchorIndex).toBe(3);
+		expect(snapshot?.filteredToRawIndices).toEqual([2, 3]);
+		expect(snapshot?.filteredMessages?.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(JSON.stringify(snapshot?.filteredMessages)).not.toContain("old-read");
+		expect(JSON.stringify(snapshot?.filteredMessages)).not.toContain("hidden tool result");
+		expect(result?.messages).toEqual(snapshot?.filteredMessages);
+	});
+
 	test("compatibility compaction no longer blocks on a previously lost anchor after recovery", async () => {
 		const harness = createHarness();
 		diligentContextExtension(harness.pi as any);

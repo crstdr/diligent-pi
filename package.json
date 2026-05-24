@@ -2,6 +2,7 @@
   "private": true,
   "scripts": {
     "test": "bun test tests",
-    "validate:local": "bun test tests"
+    "validate:local": "bun test tests",
+    "bench:context": "bun test ./benchmarks/diligent-context-context-shaping.bench.ts --timeout 120000"
   }
 }

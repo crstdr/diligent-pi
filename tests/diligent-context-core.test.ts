@@ -269,6 +269,67 @@ describe("diligent-context/core regression coverage", () => {
 		expect(filteredText).not.toContain("remember this synthetic checkpoint");
 	});
 
+	test("buildRuntimeSnapshotFromProjection matches raw-message wrapper and keeps clone isolation", () => {
+		const rawMessages = [
+			assistantToolCall({ id: "old-call", name: "read_file", arguments: { path: "old.ts" } }),
+			toolResult("old-call", "old result"),
+			assistantText("anchor"),
+			assistantText("visible tail"),
+		];
+		const state = core.buildAnchoredState({
+			anchorMode: "after-entry",
+			anchorFingerprint: core.computePayloadFingerprint(rawMessages[2], 2),
+		});
+		const projection = core.computeVisibleSnapshot({ rawMessages, state });
+
+		const fromProjection = core.buildRuntimeSnapshotFromProjection({ rawMessages, state, projection });
+		const fromRawMessages = core.buildRuntimeSnapshotFromRawMessages(rawMessages, state);
+
+		expect(fromProjection).toEqual(fromRawMessages);
+		expect(fromProjection.state).toBe(state);
+		expect(fromProjection.rawMessages).not.toBe(rawMessages);
+		expect(fromProjection.rawMessages?.[0]).not.toBe(rawMessages[0]);
+		expect(fromProjection.filteredMessages).not.toBe(projection.filteredMessages);
+		expect(fromProjection.filteredMessages?.[0]).not.toBe(projection.filteredMessages[0]);
+		expect(fromProjection.filteredToRawIndices).toEqual(projection.keptRawIndices);
+		expect(fromProjection.filteredToRawIndices).not.toBe(projection.keptRawIndices);
+
+		(rawMessages[2] as any).content = [{ type: "text", text: "mutated raw anchor" }];
+		(projection.filteredMessages[0] as any).content = [{ type: "text", text: "mutated projection anchor" }];
+
+		const snapshotText = JSON.stringify(fromProjection);
+		expect(snapshotText).not.toContain("mutated raw anchor");
+		expect(snapshotText).not.toContain("mutated projection anchor");
+	});
+
+	test("buildRuntimeSnapshotFromProjection never includes projected checkpoint messages", () => {
+		const rawMessages = [assistantText("anchor"), assistantText("tail")];
+		const state = core.withCheckpoint(
+			core.buildAnchoredState({
+				anchorMode: "after-entry",
+				anchorFingerprint: core.computePayloadFingerprint(rawMessages[0], 0),
+			}),
+			core.buildCheckpointArtifact({
+				kind: "contemplation",
+				body: "remember this projection synthetic checkpoint",
+				id: "contemplation-projection-1",
+				createdAt: "2026-05-24T00:00:00.000Z",
+			}),
+		);
+		const projection = core.computeVisibleSnapshot({ rawMessages, state });
+
+		const snapshot = core.buildRuntimeSnapshotFromProjection({ rawMessages, state, projection });
+		const rawText = JSON.stringify(snapshot.rawMessages);
+		const filteredText = JSON.stringify(snapshot.filteredMessages);
+
+		expect(snapshot.rawMessages).toHaveLength(rawMessages.length);
+		expect(snapshot.filteredToRawIndices.every((index) => index >= 0 && index < rawMessages.length)).toBe(true);
+		expect(rawText).not.toContain("[Diligent contemplation checkpoint]");
+		expect(filteredText).not.toContain("[Diligent contemplation checkpoint]");
+		expect(rawText).not.toContain("remember this projection synthetic checkpoint");
+		expect(filteredText).not.toContain("remember this projection synthetic checkpoint");
+	});
+
 	test("computeVisibleSnapshot is independent of active checkpoints", () => {
 		const rawMessages = [assistantText("anchor"), assistantText("tail")];
 		const baseState = core.buildAnchoredState({
