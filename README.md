@@ -1,16 +1,25 @@
 # diligent-pi
 
-A small collection of Pi extensions focused on **careful context shaping** and **extension-owned memory checkpoints** rather than maximal automation.
+A small collection of Pi extensions for keeping long AI-assisted development sessions focused without constantly stopping to compact.
 
-This repo is the canonical source of truth for the diligent extensions. Downstream projects should vendor or copy from here rather than becoming the primary implementation surface.
+The core workflow is `/diligent-context here`: when you reach a useful milestone in a dev session, run it to mark the current point as the context boundary. From then on, older tool-call chatter before that boundary is hidden from the LLM at runtime, while the human conversation and recent work stay visible.
+
+Nothing is deleted or rewritten. The transcript remains intact; `diligent-context` only shapes what Pi sends to the model.
+
+In practice, this lets you turn a session that is nearing the context limit back into a manageable working set, without doing a lossy compaction or interrupting your flow.
+
+The companion extensions build on that boundary:
+
+- `diligent-compact` makes `/compact` respect the same visible context boundary if you do compact later.
+- `diligent-contemplate` creates a richer hand-over summary before resetting the boundary, so you can preserve the important decisions and state from the milestone before hiding more tool-heavy history.
 
 ## Extensions
 
 Install the extensions together in dependency order:
 
-1. **diligent-context** — owns the pruning boundary, hides stale tool chatter from the live model payload, preserves human conversation, and persists boundary-surviving checkpoints.
-2. **diligent-compact** — keeps `/compact` and explicit `/diligent-compact` aligned with the same diligent-visible universe the model sees, carrying active checkpoints forward as structured summary input.
-3. **diligent-contemplate** — explicitly generates semantic contemplation checkpoints, stores them through `diligent-context`, and re-anchors after the represented real visible payload.
+1. **diligent-context**: owns the pruning boundary, hides stale tool chatter from the live model payload, preserves human conversation, and persists boundary-surviving checkpoints.
+2. **diligent-compact**: keeps `/compact` and explicit `/diligent-compact` aligned with the same diligent-visible universe the model sees, carrying active checkpoints forward as structured summary input.
+3. **diligent-contemplate**: explicitly generates semantic contemplation checkpoints, stores them through `diligent-context`, and re-anchors after the represented real visible payload.
 
 Dependency notes:
 
@@ -65,20 +74,20 @@ If you remove installed folders before copying, back up and restore:
 
 ### diligent-context
 
-- `/diligent-context` — open the control menu.
-- `/diligent-context here` — set the boundary after the current live payload tail, or store a pending intent if no live payload exists yet.
-- `/diligent-context pick` — pick a boundary from the current live payload.
-- `/diligent-context off` — disable diligent-context and clear active checkpoints.
+- `/diligent-context`: open the control menu.
+- `/diligent-context here`: set the boundary after the current live payload tail, or store a pending intent if no live payload exists yet.
+- `/diligent-context pick`: pick a boundary from the current live payload.
+- `/diligent-context off`: disable diligent-context and clear active checkpoints.
 
 ### diligent-compact
 
-- `/compact` — use Pi's normal compaction command; when `diligent-context` is active, this is routed through a visibility-aware compatibility path.
-- `/diligent-compact [instructions]` — run the explicit opinionated compaction path using the configured model/prompt/thinking stack.
-- `/diligent-compact --force-native [instructions]` — one-shot native override that intentionally bypasses diligent visibility guarantees.
+- `/compact`: use Pi's normal compaction command; when `diligent-context` is active, this is routed through a visibility-aware compatibility path.
+- `/diligent-compact [instructions]`: run the explicit opinionated compaction path using the configured model/prompt/thinking stack.
+- `/diligent-compact --force-native [instructions]`: one-shot native override that intentionally bypasses diligent visibility guarantees.
 
 ### diligent-contemplate
 
-- `/diligent-contemplate [custom prompt]` — generate a contemplation checkpoint from the current diligent-visible live payload.
+- `/diligent-contemplate [custom prompt]`: generate a contemplation checkpoint from the current diligent-visible live payload.
 
 ## Model configuration
 
