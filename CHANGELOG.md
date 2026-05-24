@@ -11,6 +11,7 @@ All notable user-facing changes to `diligent-pi` should be recorded here.
 - Added `extensions/diligent-compact/config.local.example.json` to document ignored installed overrides.
 - Added direct tests for compaction visibility/preparation seams, diligent-context checkpoint/projection invariants, and diligent-contemplate command safety paths.
 - Added contributor documentation and expanded user-facing install/update/config/troubleshooting docs.
+- Added an investigation report for `/diligent-context` boundary safety against active model context-window limits.
 
 ### Changed
 

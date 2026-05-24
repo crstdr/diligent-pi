@@ -8,6 +8,8 @@ Nothing is deleted or rewritten. The transcript remains intact; `diligent-contex
 
 In practice, this lets you turn a session that is nearing the context limit back into a manageable working set, without doing a lossy compaction or interrupting your flow.
 
+This is still a pruning boundary, not a hard fit guarantee. If the remaining human conversation and recent work are themselves too large for the selected model, you may still need to move the boundary later, run compaction, or switch to a larger-context model.
+
 The companion extensions build on that boundary:
 
 - `diligent-compact` makes `/compact` respect the same visible context boundary if you do compact later.

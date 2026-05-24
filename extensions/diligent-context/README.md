@@ -11,6 +11,8 @@ The design is **payload-grounded**:
 
 This keeps the UX honest: what the user selects is what the model actually stops seeing.
 
+`/diligent-context` does not currently guarantee that the remaining visible payload fits the active model's context window. It only removes historical tool baggage. If the preserved human/assistant narrative is still too large, use a later boundary, compaction, or a larger-context model.
+
 ---
 
 ## Design goals
