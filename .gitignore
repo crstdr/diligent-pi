@@ -1,3 +1,9 @@
 .DS_Store
 AGENTS.md
 roadmap.md
+
+node_modules/
+.pi/
+prompt-exports/
+extensions/diligent-compact/config.local.json
+extensions/diligent-compact/compactions/

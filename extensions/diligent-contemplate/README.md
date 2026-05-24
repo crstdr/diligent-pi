@@ -32,8 +32,10 @@ The command fails fast and writes nothing when:
 - no current diligent-visible live payload exists yet
 - the diligent boundary is still restoring
 - nothing new has happened since the active contemplation checkpoint
+- the visible-to-raw snapshot mapping is invalid
 - the visible live payload changed while the checkpoint was generating
-- no configured model/API key is available
+- the active session changed while the checkpoint was generating
+- no configured candidate or current session model auth is available
 - the prompt exceeds the selected model's safe input budget
 - the model returns empty output
 
@@ -47,15 +49,27 @@ Edit:
 
 ## Model configuration
 
-`diligent-contemplate` reuses:
+`diligent-contemplate` reuses the layered model configuration owned by `diligent-compact`:
 
-- `extensions/diligent-compact/config.json`
+1. in-code defaults
+2. shipped `extensions/diligent-compact/config.json`
+3. ignored local override `config.local.json` in the installed `diligent-compact` directory
 
-So the configured compaction model order also controls contemplation.
+For user-level installs, copy `extensions/diligent-compact/config.local.example.json` to:
+
+- `~/.pi/agent/extensions/diligent-compact/config.local.json`
+
+For project-local installs, copy it to:
+
+- `<your-project>/.pi/extensions/diligent-compact/config.local.json`
+
+The configured compaction model order also controls contemplation. Unavailable configured candidates or candidates without usable API-key/request-header auth are skipped. If all configured candidates are skipped, contemplation falls back to the current session model and reports that fallback once; if no configured or current model auth is usable, it writes nothing.
+
+Invalid local config is reported as a warning and falls back instead of crashing extension import.
 
 ## Persistence model
 
-The contemplation result is **not** saved as a real assistant message.
+The contemplation result is **not** saved as a real assistant message, and the command does not require a Pi-core assistant-message persistence API.
 
 Instead:
 - `diligent-context` owns the active checkpoint inside persisted diligent state

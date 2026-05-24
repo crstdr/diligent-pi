@@ -32,6 +32,7 @@ If `diligent-context` is active:
 - keeps the recent visible suffix untouched
 - carries any active diligent checkpoints forward as structured summary input
 - then calls Pi's exported native `compact(...)` helper on that synthetic preparation
+- preserves current Pi model-registry auth, including API keys and/or request headers, plus custom instructions, abort signal, and the current thinking level
 
 ### 3. Opinionated
 If the user explicitly runs `/diligent-compact`:
@@ -60,6 +61,8 @@ Any trailing text is forwarded as compaction focus instructions.
 ### `/diligent-compact --force-native [instructions]`
 Run one explicit degraded native compaction.
 
+The command warns that diligent visibility guarantees are suspended for that one run.
+
 ## Checkpoint carry-forward
 
 Active diligent checkpoints are **not** treated as ordinary message history for compaction.
@@ -81,12 +84,37 @@ The opinionated path reads this file at compaction time, so you can iterate on t
 
 ## Configuration
 
-Edit:
+Model configuration is layered:
 
-- `extensions/diligent-compact/config.json`
+1. in-code defaults
+2. shipped `extensions/diligent-compact/config.json`
+3. ignored local override `config.local.json` in the installed `diligent-compact` directory
 
-`config.json` affects the explicit `/diligent-compact` path and the shared opinionated stack used by `/diligent-contemplate`.
-The compatibility route behind `/compact` uses the current session model so it stays close to Pi's native compaction behavior.
+For a user-level install, copy `config.local.example.json` to:
+
+- `~/.pi/agent/extensions/diligent-compact/config.local.json`
+
+For a project-local install, copy it to:
+
+- `<your-project>/.pi/extensions/diligent-compact/config.local.json`
+
+`config.local.json` affects the explicit `/diligent-compact` path and the shared opinionated stack used by `/diligent-contemplate` without being overwritten by repo updates.
+
+Merge rules:
+- missing fields inherit the prior layer
+- `compactionModels: []` intentionally disables configured candidates and uses current-session fallback only
+- a non-empty model list replaces the prior layer only when at least one entry has a valid `provider` and `id`
+- invalid `thinkingLevel` or `debugCompactions` values are ignored and reported as diagnostics
+
+The shipped candidate order is:
+
+1. `anthropic/claude-opus-4-7` with `thinkingLevel: "xhigh"`
+2. `openai-codex/gpt-5.5` with `thinkingLevel: "xhigh"`
+3. `openai-codex/gpt-5.4` with `thinkingLevel: "xhigh"`
+4. `anthropic/claude-sonnet-4-6` with `thinkingLevel: "high"`
+5. the current session model as the final runtime fallback
+
+At runtime, unavailable candidates or candidates without usable auth are skipped. Usable auth can be an API key and/or request headers from Pi's model registry. If all configured candidates are skipped, the opinionated paths fall back to the current session model and report that fallback once. The compatibility route behind `/compact` intentionally uses the current session model so it stays close to Pi's native compaction behavior.
 
 ## Failure posture
 

@@ -71,6 +71,29 @@ function assistantText(text: string): EventMessage {
 	return { role: "assistant", content: [{ type: "text", text }] };
 }
 
+function assistantToolCall(args: { id: string; name: string; arguments?: Record<string, unknown> }): EventMessage {
+	return {
+		role: "assistant",
+		content: [
+			{
+				type: "toolCall",
+				id: args.id,
+				name: args.name,
+				arguments: args.arguments ?? {},
+			},
+		],
+	};
+}
+
+function toolResult(toolCallId: string, text: string, isError = false): EventMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		content: text,
+		isError,
+	};
+}
+
 function messageEntry(id: string, message: EventMessage): SessionEntry & { id: string; type: string; message: EventMessage } {
 	return { id, type: "message", message };
 }
@@ -78,6 +101,7 @@ function messageEntry(id: string, message: EventMessage): SessionEntry & { id: s
 function createHarness() {
 	const branchEntries: Array<Record<string, unknown>> = [];
 	const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
+	const commands = new Map<string, (args: unknown, ctx: any) => any>();
 	let nextId = 1;
 	const pi = {
 		on(event: string, handler: (event: any, ctx: any) => any) {
@@ -85,7 +109,10 @@ function createHarness() {
 			current.push(handler);
 			handlers.set(event, current);
 		},
-		registerCommand(_name: string, _config: unknown) {},
+		registerCommand(name: string, config: unknown) {
+			const handler = (config as { handler?: (args: unknown, ctx: any) => any }).handler;
+			if (typeof handler === "function") commands.set(name, handler);
+		},
 		appendEntry(customType: string, data: unknown) {
 			branchEntries.push({ id: `custom-${nextId++}`, type: "custom", customType, data });
 		},
@@ -120,7 +147,7 @@ function createHarness() {
 		},
 		compact: () => {},
 	};
-	return { branchEntries, handlers, pi, ctx };
+	return { branchEntries, handlers, commands, pi, ctx };
 }
 
 beforeEach(() => {
@@ -209,5 +236,216 @@ describe("diligent-context lost-anchor recovery", () => {
 
 		expect(result?.cancel).toBeUndefined();
 		expect(result?.compaction?.summary).toBe("compat summary");
+	});
+
+	test("pending-here materializes without preserving stale checkpoints", async () => {
+		const harness = createHarness();
+		diligentContextExtension(harness.pi as any);
+
+		const rawMessages = [userText("Please anchor on this next live payload.")];
+		harness.branchEntries.push({
+			id: "state-1",
+			type: "custom",
+			customType: core.DILIGENT_CONTEXT_CUSTOM_TYPE,
+			data: {
+				enabled: true,
+				anchorMode: "pending-here",
+				anchorFingerprint: null,
+				checkpoints: {
+					provenance: core.buildCheckpointArtifact({
+						kind: "provenance",
+						body: "stale provenance",
+						id: "stale-provenance",
+						createdAt: "2026-05-24T00:00:00.000Z",
+					}),
+					contemplation: core.buildCheckpointArtifact({
+						kind: "contemplation",
+						body: "stale contemplation",
+						id: "stale-contemplation",
+						createdAt: "2026-05-24T00:00:00.000Z",
+					}),
+				},
+			},
+		});
+
+		const contextHandler = harness.handlers.get("context")?.[0];
+		await contextHandler?.({ messages: rawMessages }, harness.ctx);
+
+		const latestState = core.loadStateFromEntries(harness.branchEntries as SessionEntry[]);
+		expect(latestState.anchorMode).toBe("after-entry");
+		expect(latestState.checkpoints).toEqual(core.EMPTY_CHECKPOINTS);
+	});
+
+	test("context hook projects checkpoints while runtime snapshot remains raw-grounded", async () => {
+		const harness = createHarness();
+		diligentContextExtension(harness.pi as any);
+
+		const rawMessages = [userText("anchor"), assistantText("visible tail")];
+		const checkpoint = core.buildCheckpointArtifact({
+			kind: "contemplation",
+			body: "project this checkpoint only at context return",
+			id: "contemplation-1",
+			createdAt: "2026-05-24T00:00:00.000Z",
+		});
+		const state = core.buildAnchoredState({
+			anchorMode: "after-entry",
+			anchorFingerprint: core.computePayloadFingerprint(rawMessages[0], 0),
+			checkpoints: { contemplation: checkpoint },
+		});
+		harness.branchEntries.push(
+			...rawMessages.map((message, index) => messageEntry(`msg-${index + 1}`, message)),
+			{
+				id: "state-1",
+				type: "custom",
+				customType: core.DILIGENT_CONTEXT_CUSTOM_TYPE,
+				data: state,
+			},
+		);
+
+		const contextHandler = harness.handlers.get("context")?.[0];
+		const result = await contextHandler?.({ messages: rawMessages }, harness.ctx);
+
+		expect(JSON.stringify(result?.messages?.[0])).toContain("[Diligent contemplation checkpoint]");
+		expect(JSON.stringify(result?.messages?.[0])).toContain("project this checkpoint only at context return");
+
+		const snapshot = core.getDiligentContextRuntimeSnapshot("session-1");
+		expect(snapshot?.rawMessages).toHaveLength(rawMessages.length);
+		expect(snapshot?.filteredMessages).toHaveLength(rawMessages.length);
+		expect(snapshot?.filteredToRawIndices).toEqual([0, 1]);
+		expect(JSON.stringify(snapshot?.rawMessages)).not.toContain("project this checkpoint only at context return");
+		expect(JSON.stringify(snapshot?.filteredMessages)).not.toContain("project this checkpoint only at context return");
+	});
+
+	test("manual re-anchor clears contemplation and regenerates provenance", async () => {
+		const harness = createHarness();
+		diligentContextExtension(harness.pi as any);
+
+		const rawMessages = [
+			assistantToolCall({ id: "write-1", name: "bash", arguments: { command: "echo hi > src/new.ts" } }),
+			toolResult("write-1", "wrote file"),
+			assistantText("Finished writing the file."),
+		];
+		const previousState = core.buildAnchoredState({
+			anchorMode: "after-entry",
+			anchorFingerprint: core.computePayloadFingerprint(rawMessages[0], 0),
+			checkpoints: {
+				provenance: core.buildCheckpointArtifact({
+					kind: "provenance",
+					body: "stale provenance",
+					id: "old-provenance",
+					createdAt: "2026-05-24T00:00:00.000Z",
+				}),
+				contemplation: core.buildCheckpointArtifact({
+					kind: "contemplation",
+					body: "stale contemplation",
+					id: "old-contemplation",
+					createdAt: "2026-05-24T00:00:00.000Z",
+				}),
+			},
+		});
+		harness.branchEntries.push(
+			...rawMessages.map((message, index) => messageEntry(`msg-${index + 1}`, message)),
+			{
+				id: "state-1",
+				type: "custom",
+				customType: core.DILIGENT_CONTEXT_CUSTOM_TYPE,
+				data: previousState,
+			},
+		);
+
+		const contextHandler = harness.handlers.get("context")?.[0];
+		await contextHandler?.({ messages: rawMessages }, harness.ctx);
+		const commandHandler = harness.commands.get("diligent-context");
+		expect(commandHandler).toBeDefined();
+		await commandHandler?.("here", harness.ctx);
+
+		const latestState = core.loadStateFromEntries(harness.branchEntries as SessionEntry[]);
+		expect(latestState.anchorMode).toBe("after-entry");
+		expect(latestState.checkpoints.contemplation).toBeNull();
+		expect(latestState.checkpoints.provenance).not.toBeNull();
+		expect(latestState.checkpoints.provenance?.id).not.toBe("old-provenance");
+		expect(latestState.checkpoints.provenance?.body).toContain("<written>");
+		expect(latestState.checkpoints.provenance?.body).toContain("- src/new.ts");
+	});
+
+	test("session_compact clears active checkpoints by appending updated diligent state", async () => {
+		const harness = createHarness();
+		diligentContextExtension(harness.pi as any);
+
+		const activeState = core.buildAnchoredState({
+			anchorMode: "after-entry",
+			anchorFingerprint: core.computePayloadFingerprint(userText("anchor"), 0),
+			checkpoints: {
+				provenance: core.buildCheckpointArtifact({
+					kind: "provenance",
+					body: "read src/a.ts",
+					id: "provenance-1",
+					createdAt: "2026-05-24T00:00:00.000Z",
+				}),
+				contemplation: core.buildCheckpointArtifact({
+					kind: "contemplation",
+					body: "remember this",
+					id: "contemplation-1",
+					createdAt: "2026-05-24T00:00:00.000Z",
+				}),
+			},
+		});
+		harness.branchEntries.push({
+			id: "state-1",
+			type: "custom",
+			customType: core.DILIGENT_CONTEXT_CUSTOM_TYPE,
+			data: activeState,
+		});
+		const beforeCount = harness.branchEntries.length;
+
+		const compactHandler = harness.handlers.get("session_compact")?.[0];
+		expect(compactHandler).toBeDefined();
+		await compactHandler?.({}, harness.ctx);
+
+		expect(harness.branchEntries.length).toBe(beforeCount + 1);
+		const latestState = core.loadStateFromEntries(harness.branchEntries as SessionEntry[]);
+		expect(latestState.checkpoints).toEqual(core.EMPTY_CHECKPOINTS);
+	});
+
+	test("lost-anchor recovery does not preserve stale checkpoints from the lost boundary", async () => {
+		const harness = createHarness();
+		diligentContextExtension(harness.pi as any);
+
+		const rawMessages = [userText("Please continue."), assistantText("Working on it.")];
+		const staleState = core.buildAnchoredState({
+			anchorMode: "after-entry",
+			anchorFingerprint: core.computePayloadFingerprint(assistantText("old anchor"), 0),
+			checkpoints: {
+				provenance: core.buildCheckpointArtifact({
+					kind: "provenance",
+					body: "stale provenance",
+					id: "stale-provenance",
+					createdAt: "2026-05-24T00:00:00.000Z",
+				}),
+				contemplation: core.buildCheckpointArtifact({
+					kind: "contemplation",
+					body: "stale contemplation",
+					id: "stale-contemplation",
+					createdAt: "2026-05-24T00:00:00.000Z",
+				}),
+			},
+		});
+		harness.branchEntries.push(
+			...rawMessages.map((message, index) => messageEntry(`msg-${index + 1}`, message)),
+			{
+				id: "state-1",
+				type: "custom",
+				customType: core.DILIGENT_CONTEXT_CUSTOM_TYPE,
+				data: staleState,
+			},
+		);
+
+		const contextHandler = harness.handlers.get("context")?.[0];
+		await contextHandler?.({ messages: rawMessages }, harness.ctx);
+
+		const latestState = core.loadStateFromEntries(harness.branchEntries as SessionEntry[]);
+		expect(latestState.anchorMode).toBe("after-entry");
+		expect(latestState.checkpoints.contemplation).toBeNull();
+		expect(latestState.checkpoints.provenance).toBeNull();
 	});
 });

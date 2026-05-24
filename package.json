@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "scripts": {
+    "test": "bun test tests",
+    "validate:local": "bun test tests"
+  }
+}

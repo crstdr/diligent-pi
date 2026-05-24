@@ -16,7 +16,6 @@ import {
 	buildRuntimeSnapshotFromRawMessages,
 	computePayloadFingerprint,
 	getActiveCheckpoints,
-	getContextAlignmentComparable,
 	getDiligentContextRuntimeSnapshot,
 	getDiligentContextStateSignature,
 	loadStateFromSession,
@@ -31,6 +30,7 @@ import {
 	assertPromptFitsBudget,
 	COMPACTION_TIMEOUT_MS,
 	debugLog,
+	emitSelectionDiagnosticsWarning,
 	selectOpinionatedModel,
 	startTimedCompactionSignal,
 } from "../diligent-compact/shared.ts";
@@ -72,21 +72,39 @@ function loadPromptBody(): string {
 }
 
 function notify(ctx: ExtensionCommandContext, text: string, level: "info" | "warning" | "error" = "info"): void {
-	if (ctx.hasUI) {
-		ctx.ui.notify(text, level);
+	try {
+		if (ctx.hasUI) {
+			ctx.ui.notify(text, level);
+			return;
+		}
+	} catch (error) {
+		debugLog(`diligent-contemplate notify failed: ${error instanceof Error ? error.message : String(error)}`);
 		return;
 	}
-	console.log(`[diligent-contemplate] ${level}: ${text}`);
+	try {
+		console.log(`[diligent-contemplate] ${level}: ${text}`);
+	} catch {
+		// best-effort only
+	}
 }
 
 function setStatus(ctx: ExtensionCommandContext, text?: string): void {
-	if (!ctx.hasUI) return;
-	const theme = ctx.ui.theme;
-	ctx.ui.setStatus(CONTEMPLATION_STATUS_KEY, text ? theme.fg("accent", text) : undefined);
+	try {
+		if (!ctx.hasUI) return;
+		const theme = ctx.ui.theme;
+		ctx.ui.setStatus(CONTEMPLATION_STATUS_KEY, text ? theme.fg("accent", text) : undefined);
+	} catch (error) {
+		debugLog(`diligent-contemplate status update failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
 }
 
 function getSessionId(ctx: ExtensionCommandContext): string | null {
-	return ctx.sessionManager.getSessionId?.() ?? null;
+	try {
+		return ctx.sessionManager.getSessionId?.() ?? null;
+	} catch (error) {
+		debugLog(`diligent-contemplate session lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+		return null;
+	}
 }
 
 function buildPromptText(args: {
@@ -113,15 +131,61 @@ function buildCheckpointPromptText(snapshot: DiligentContextRuntimeSnapshot): st
 	return checkpoints.map((checkpoint) => buildCheckpointDisplayText(checkpoint)).join("\n\n");
 }
 
-function hasUsableVisibleSnapshot(snapshot: DiligentContextRuntimeSnapshot | null): snapshot is DiligentContextRuntimeSnapshot & {
+type UsableVisibleSnapshot = DiligentContextRuntimeSnapshot & {
 	filteredMessages: EventMessage[];
 	rawMessages: EventMessage[];
-} {
+};
+
+function hasUsableVisibleSnapshot(snapshot: DiligentContextRuntimeSnapshot | null): snapshot is UsableVisibleSnapshot {
 	if (!snapshot?.filteredMessages || snapshot.filteredMessages.length === 0) return false;
 	if (!snapshot.rawMessages || snapshot.rawMessages.length === 0) return false;
-	if (snapshot.filteredToRawIndices.length !== snapshot.filteredMessages.length) return false;
-	if (snapshot.state.enabled && snapshot.state.anchorMode !== "pending-here" && snapshot.resolvedAnchorIndex === null) return false;
 	return true;
+}
+
+function stableStringify(value: unknown): string {
+	if (typeof value === "undefined") return '"[undefined]"';
+	if (typeof value === "number" && !Number.isFinite(value)) return JSON.stringify(String(value));
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+	const entries = Object.entries(value as Record<string, unknown>)
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringify(entryValue)}`);
+	return `{${entries.join(",")}}`;
+}
+
+function validateVisibleSnapshotMapping(snapshot: UsableVisibleSnapshot): string | null {
+	if (snapshot.filteredToRawIndices.length !== snapshot.filteredMessages.length) {
+		return `filtered/raw mapping length mismatch (${snapshot.filteredToRawIndices.length} indices for ${snapshot.filteredMessages.length} filtered messages)`;
+	}
+	let previousIndex = -1;
+	for (let filteredIndex = 0; filteredIndex < snapshot.filteredToRawIndices.length; filteredIndex++) {
+		const rawIndex = snapshot.filteredToRawIndices[filteredIndex];
+		if (typeof rawIndex !== "number" || !Number.isFinite(rawIndex) || !Number.isInteger(rawIndex)) {
+			return `filtered/raw mapping index ${filteredIndex} is not a finite integer`;
+		}
+		if (rawIndex < 0) {
+			return `filtered/raw mapping index ${filteredIndex} is negative`;
+		}
+		if (rawIndex >= snapshot.rawMessages.length) {
+			return `filtered/raw mapping index ${filteredIndex} is outside raw message bounds`;
+		}
+		if (rawIndex <= previousIndex) {
+			return `filtered/raw mapping index ${filteredIndex} is not strictly increasing`;
+		}
+		previousIndex = rawIndex;
+	}
+
+	const expectedSnapshot = buildRuntimeSnapshotFromRawMessages(snapshot.rawMessages, snapshot.state);
+	if (snapshot.resolvedAnchorIndex !== expectedSnapshot.resolvedAnchorIndex) {
+		return `resolved anchor ${snapshot.resolvedAnchorIndex ?? "null"} does not match recomputed projection ${expectedSnapshot.resolvedAnchorIndex ?? "null"}`;
+	}
+	if (stableStringify(snapshot.filteredToRawIndices) !== stableStringify(expectedSnapshot.filteredToRawIndices)) {
+		return "filtered/raw mapping does not match recomputed diligent projection";
+	}
+	if (stableStringify(snapshot.filteredMessages) !== stableStringify(expectedSnapshot.filteredMessages ?? [])) {
+		return "filtered messages do not match recomputed diligent projection";
+	}
+	return null;
 }
 
 function reconcileSnapshotWithState(
@@ -130,7 +194,13 @@ function reconcileSnapshotWithState(
 	ctx: ExtensionCommandContext,
 ): DiligentContextRuntimeSnapshot | null {
 	if (!snapshot) return null;
-	const persistedState = loadStateFromSession(ctx);
+	let persistedState;
+	try {
+		persistedState = loadStateFromSession(ctx);
+	} catch (error) {
+		debugLog(`diligent-contemplate state reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+		return null;
+	}
 	if (getDiligentContextStateSignature(snapshot.state) === getDiligentContextStateSignature(persistedState)) {
 		return snapshot;
 	}
@@ -141,13 +211,12 @@ function reconcileSnapshotWithState(
 }
 
 function buildSnapshotSignature(snapshot: DiligentContextRuntimeSnapshot): string {
-	return JSON.stringify({
+	return stableStringify({
 		state: getDiligentContextStateSignature(snapshot.state),
 		resolvedAnchorIndex: snapshot.resolvedAnchorIndex,
-		rawCount: snapshot.rawMessages?.length ?? 0,
-		filteredCount: snapshot.filteredMessages?.length ?? 0,
-		filteredToRawCount: snapshot.filteredToRawIndices.length,
-		filteredMessages: (snapshot.filteredMessages ?? []).map((message) => getContextAlignmentComparable(message)),
+		rawMessages: snapshot.rawMessages ?? null,
+		filteredMessages: snapshot.filteredMessages ?? null,
+		filteredToRawIndices: snapshot.filteredToRawIndices,
 	});
 }
 
@@ -219,14 +288,25 @@ export default function diligentContemplateExtension(pi: ExtensionAPI): void {
 				notify(ctx, "diligent-contemplate: already running for this session", "warning");
 				return;
 			}
+			inFlightBySession.add(sessionId);
+			try {
 
 			const initialSnapshot = reconcileSnapshotWithState(sessionId, getDiligentContextRuntimeSnapshot(sessionId), ctx);
 			if (!hasUsableVisibleSnapshot(initialSnapshot)) {
 				notify(ctx, "diligent-contemplate blocked: no current diligent-visible live context is available yet", "warning");
 				return;
 			}
-			if (initialSnapshot.state.enabled && initialSnapshot.state.anchorMode !== "pending-here" && initialSnapshot.resolvedAnchorIndex === null) {
-				const anchorLost = (initialSnapshot.rawMessages?.length ?? 0) > 0;
+			const initialMappingError = validateVisibleSnapshotMapping(initialSnapshot);
+			if (initialMappingError) {
+				notify(ctx, `diligent-contemplate blocked: invalid diligent-visible mapping (${initialMappingError})`, "warning");
+				return;
+			}
+			if (initialSnapshot.state.enabled && initialSnapshot.state.anchorMode === "pending-here") {
+				notify(ctx, "diligent-contemplate blocked: the current diligent-context boundary is still restoring", "warning");
+				return;
+			}
+			if (initialSnapshot.state.enabled && initialSnapshot.resolvedAnchorIndex === null) {
+				const anchorLost = initialSnapshot.rawMessages.length > 0;
 				notify(
 					ctx,
 					anchorLost
@@ -253,9 +333,19 @@ export default function diligentContemplateExtension(pi: ExtensionAPI): void {
 				customInstructions,
 			});
 			const fallbackThinkingLevel = pi.getThinkingLevel();
-			const selected = await selectOpinionatedModel(ctx, fallbackThinkingLevel);
+			const selection = await selectOpinionatedModel(ctx, fallbackThinkingLevel);
+			if (getSessionId(ctx) !== sessionId) {
+				notify(ctx, "diligent-contemplate aborted because the active session changed", "warning");
+				return;
+			}
+			emitSelectionDiagnosticsWarning(
+				"diligent-contemplate",
+				selection,
+				(text, level = "info") => notify(ctx, text, level),
+			);
+			const selected = selection.selected;
 			if (!selected) {
-				notify(ctx, "diligent-contemplate failed: no model/API key available for contemplation", "warning");
+				notify(ctx, "diligent-contemplate failed: no model auth available for contemplation", "warning");
 				return;
 			}
 			try {
@@ -278,11 +368,12 @@ export default function diligentContemplateExtension(pi: ExtensionAPI): void {
 				timestamp: Date.now(),
 			};
 			const completeOptions: {
-				apiKey: string;
+				apiKey?: string;
+				headers?: Record<string, string>;
 				reasoning?: typeof selected.thinkingLevel;
 				maxTokens: number;
 			} = {
-				apiKey: selected.apiKey,
+				...selected.auth,
 				maxTokens: CONTEMPLATION_MAX_TOKENS,
 			};
 			if (selected.thinkingLevel !== "off") {
@@ -326,7 +417,14 @@ export default function diligentContemplateExtension(pi: ExtensionAPI): void {
 				}
 
 				const liveSnapshot = reconcileSnapshotWithState(sessionId, getDiligentContextRuntimeSnapshot(sessionId), ctx);
-				if (!liveSnapshot || buildSnapshotSignature(liveSnapshot) !== startingSignature) {
+				if (!liveSnapshot) {
+					throw new Error("diligent-contemplate aborted because the live visible context changed while the checkpoint was generating");
+				}
+				const liveMappingError = validateVisibleSnapshotMapping(liveSnapshot);
+				if (liveMappingError) {
+					throw new Error(`diligent-contemplate aborted because the live visible mapping became invalid: ${liveMappingError}`);
+				}
+				if (buildSnapshotSignature(liveSnapshot) !== startingSignature) {
 					throw new Error("diligent-contemplate aborted because the live visible context changed while the checkpoint was generating");
 				}
 				if (getSessionId(ctx) !== sessionId) {
@@ -361,6 +459,9 @@ export default function diligentContemplateExtension(pi: ExtensionAPI): void {
 						contemplation: contemplationCheckpoint,
 					},
 				});
+				if (getSessionId(ctx) !== sessionId) {
+					throw new Error("diligent-contemplate aborted because the active session changed");
+				}
 
 				pi.appendEntry(DILIGENT_CONTEXT_CUSTOM_TYPE, nextState);
 				const rebuiltSnapshot = buildRuntimeSnapshotFromRawMessages(liveSnapshot.rawMessages, nextState);
@@ -368,7 +469,7 @@ export default function diligentContemplateExtension(pi: ExtensionAPI): void {
 				emitCheckpointMessages(liveSnapshot, contemplationCheckpoint, nextProvenance, pi);
 
 				debugLog(
-					`diligent-contemplate success provider=${selected.model.provider} model=${selected.model.id} visible=${liveSnapshot.filteredMessages.length}`,
+					`diligent-contemplate success provider=${selected.model.provider} model=${selected.model.id} source=${selected.source} visible=${liveSnapshot.filteredMessages.length}`,
 				);
 				notify(ctx, "diligent-contemplate: contemplation checkpoint saved and diligent-context moved after it", "info");
 			} catch (error) {
@@ -380,6 +481,9 @@ export default function diligentContemplateExtension(pi: ExtensionAPI): void {
 				abortControllersBySession.delete(sessionId);
 				inFlightBySession.delete(sessionId);
 				setStatus(ctx, undefined);
+			}
+			} finally {
+				inFlightBySession.delete(sessionId);
 			}
 		},
 	});

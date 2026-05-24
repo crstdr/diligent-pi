@@ -194,4 +194,102 @@ describe("diligent-context/core regression coverage", () => {
 		expect(checkpoint?.body).toContain("<written>\n- old.ts\n</written>");
 		expect(checkpoint?.body).not.toContain("<written>\n- new.ts\n</written>");
 	});
+
+	test("normalizeState rejects legacy and invalid enabled state shapes", () => {
+		const fingerprint = core.computePayloadFingerprint(assistantText("anchor"), 0);
+		const validShape = {
+			enabled: true,
+			anchorMode: "after-entry",
+			anchorFingerprint: fingerprint,
+			checkpoints: {},
+		};
+
+		expect(core.normalizeState({ ...validShape, keepLast: 12 })).toEqual(core.OFF_STATE);
+		expect(core.normalizeState({ ...validShape, anchorEntryId: "entry-1" })).toEqual(core.OFF_STATE);
+		expect(core.normalizeState({ ...validShape, anchorMode: "invalid" })).toEqual(core.OFF_STATE);
+		expect(core.normalizeState({ ...validShape, anchorFingerprint: null })).toEqual(core.OFF_STATE);
+		expect(core.normalizeState({ ...validShape, enabled: "true" })).toEqual(core.OFF_STATE);
+	});
+
+	test("pending-here normalizes without active checkpoints", () => {
+		const staleProvenance = core.buildCheckpointArtifact({
+			kind: "provenance",
+			body: "stale provenance",
+			id: "provenance-stale",
+			createdAt: "2026-05-24T00:00:00.000Z",
+		});
+		const staleContemplation = core.buildCheckpointArtifact({
+			kind: "contemplation",
+			body: "stale contemplation",
+			id: "contemplation-stale",
+			createdAt: "2026-05-24T00:00:00.000Z",
+		});
+
+		const state = core.normalizeState({
+			enabled: true,
+			anchorMode: "pending-here",
+			anchorFingerprint: null,
+			checkpoints: {
+				provenance: staleProvenance,
+				contemplation: staleContemplation,
+			},
+		});
+
+		expect(state.enabled).toBe(true);
+		expect(state.anchorMode).toBe("pending-here");
+		expect(state.anchorFingerprint).toBeNull();
+		expect(state.checkpoints).toEqual(core.EMPTY_CHECKPOINTS);
+		expect(core.getActiveCheckpoints(state)).toEqual([]);
+	});
+
+	test("buildRuntimeSnapshotFromRawMessages never includes projected checkpoint messages", () => {
+		const rawMessages = [assistantText("anchor"), assistantText("tail")];
+		const state = core.withCheckpoint(
+			core.buildAnchoredState({
+				anchorMode: "after-entry",
+				anchorFingerprint: core.computePayloadFingerprint(rawMessages[0], 0),
+			}),
+			core.buildCheckpointArtifact({
+				kind: "contemplation",
+				body: "remember this synthetic checkpoint",
+				id: "contemplation-1",
+				createdAt: "2026-05-24T00:00:00.000Z",
+			}),
+		);
+
+		const snapshot = core.buildRuntimeSnapshotFromRawMessages(rawMessages, state);
+		const rawText = JSON.stringify(snapshot.rawMessages);
+		const filteredText = JSON.stringify(snapshot.filteredMessages);
+
+		expect(snapshot.rawMessages).toHaveLength(rawMessages.length);
+		expect(snapshot.filteredToRawIndices.every((index) => index >= 0 && index < rawMessages.length)).toBe(true);
+		expect(rawText).not.toContain("[Diligent contemplation checkpoint]");
+		expect(filteredText).not.toContain("[Diligent contemplation checkpoint]");
+		expect(rawText).not.toContain("remember this synthetic checkpoint");
+		expect(filteredText).not.toContain("remember this synthetic checkpoint");
+	});
+
+	test("computeVisibleSnapshot is independent of active checkpoints", () => {
+		const rawMessages = [assistantText("anchor"), assistantText("tail")];
+		const baseState = core.buildAnchoredState({
+			anchorMode: "after-entry",
+			anchorFingerprint: core.computePayloadFingerprint(rawMessages[0], 0),
+		});
+		const checkpointState = core.withCheckpoint(
+			baseState,
+			core.buildCheckpointArtifact({
+				kind: "provenance",
+				body: "read src/a.ts",
+				id: "provenance-1",
+				createdAt: "2026-05-24T00:00:00.000Z",
+			}),
+		);
+
+		const withoutCheckpoint = core.computeVisibleSnapshot({ rawMessages, state: baseState });
+		const withCheckpoint = core.computeVisibleSnapshot({ rawMessages, state: checkpointState });
+
+		expect(withCheckpoint.filteredMessages).toEqual(withoutCheckpoint.filteredMessages);
+		expect(withCheckpoint.keptRawIndices).toEqual(withoutCheckpoint.keptRawIndices);
+		expect(withCheckpoint.resolvedAnchorIndex).toBe(withoutCheckpoint.resolvedAnchorIndex);
+	});
 });
