@@ -1,6 +1,6 @@
 # diligent-pi
 
-A small collection of Pi extensions for keeping long AI-assisted development sessions focused without constantly stopping to compact.
+A small collection of Pi extensions for keeping long sessions focused without constantly stopping to compact.
 
 The core workflow is `/diligent-context here`: when you reach a useful milestone in a dev session, run it to mark the current point as the context boundary. From then on, older tool-call chatter before that boundary is hidden from the LLM at runtime, while the human conversation and recent work stay visible.
 
